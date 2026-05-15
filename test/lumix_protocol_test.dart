@@ -1,5 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sciens_gimbal_controller/camera/lumix_protocol.dart';
+
+String _loadFixture(String name) =>
+    File('test/fixtures/lumix/$name').readAsStringSync();
 
 void main() {
   group('lumix_protocol — URL builders', () {
@@ -213,12 +218,14 @@ void main() {
       expect(isResultOk('<x><result>Ok</result></x>'), true);
     });
 
-    test('parseGetSetting extracts inner text by type tag', () {
+    test('parseGetSetting reads the value from an XML attribute', () {
+      // Schema confirmed against S5D fixture:
+      //   <settingvalue shtrspeed="2048/256"></settingvalue>
       const body =
           '<?xml version="1.0"?><camrply><result>ok</result>'
-          '<settingvalue><shtrspeed>3328/256</shtrspeed></settingvalue>'
+          '<settingvalue shtrspeed="2048/256"></settingvalue>'
           '</camrply>';
-      expect(parseGetSetting(body, 'shtrspeed'), '3328/256');
+      expect(parseGetSetting(body, 'shtrspeed'), '2048/256');
       expect(parseGetSetting(body, 'iso'), null);
     });
 
@@ -275,6 +282,119 @@ void main() {
   </device>
 </root>''';
       expect(isLumixDescriptor(desc), true);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fixture-driven tests. Real XML captured from a Panasonic S5D
+  // (firmware VD4.30) at fixture-capture time. See
+  // test/fixtures/lumix/.
+  // -------------------------------------------------------------------------
+
+  group('lumix_protocol — getsetting fixtures (S5D)', () {
+    test('shtrspeed: attribute value is "2048/256"', () {
+      final body = _loadFixture('getsetting_shtrspeed.xml');
+      expect(isResultOk(body), true);
+      expect(parseGetSetting(body, 'shtrspeed'), '2048/256');
+      // Sanity: 2048/256 decodes to 1/256 s.
+      final s = shutterWireToSeconds('2048/256')!;
+      expect((s - 1 / 256).abs() < 1e-9, true);
+    });
+
+    test('iso: attribute value is "auto"', () {
+      final body = _loadFixture('getsetting_iso.xml');
+      expect(isResultOk(body), true);
+      expect(parseGetSetting(body, 'iso'), 'auto');
+    });
+
+    test('focal: sentinel 32767/256 → apertureFromGetSetting returns null',
+        () {
+      final body = _loadFixture('getsetting_focal.xml');
+      expect(isResultOk(body), true);
+      expect(parseGetSetting(body, 'focal'), '32767/256');
+      // The sentinel signals "no aperture data" — we must NOT
+      // produce a number from it.
+      expect(apertureFromGetSetting(body), null);
+    });
+
+    test('focal: real value → real f-number', () {
+      const body = '<?xml version="1.0"?><camrply><result>ok</result>'
+          '<settingvalue focal="598/256"></settingvalue></camrply>';
+      // 598/256 → pow(2, 598/512) ≈ 2.2
+      final f = apertureFromGetSetting(body)!;
+      expect((f - 2.2).abs() < 0.05, true);
+    });
+  });
+
+  group('lumix_protocol — getstate fixture (S5D)', () {
+    test('parses cammode / battery / firmware / sdcard', () {
+      final body = _loadFixture('getstate.xml');
+      expect(isResultOk(body), true);
+      final state = parseGetState(body)!;
+      expect(state.cammode, 'play');
+      expect(state.battery, '5/5');
+      expect(state.firmwareVersion, 'VD4.30');
+      expect(state.sdCardStatus, 'write_enable');
+      expect(state.isPlayMode, true);
+      expect(state.isRecMode, false);
+    });
+
+    test('synthetic rec-mode body flips isRecMode', () {
+      const body = '<?xml version="1.0"?>'
+          '<camrply><result>ok</result>'
+          '<state><cammode>rec</cammode><batt>4/5</batt>'
+          '<version>VD4.30</version>'
+          '<sdcardstatus>write_enable</sdcardstatus></state></camrply>';
+      final state = parseGetState(body)!;
+      expect(state.isRecMode, true);
+      expect(state.isPlayMode, false);
+    });
+
+    test('missing <state> → null', () {
+      const body =
+          '<?xml version="1.0"?><camrply><result>err</result></camrply>';
+      expect(parseGetState(body), null);
+    });
+  });
+
+  group('lumix_protocol — getinfo allmenu fixture (S5D)', () {
+    test('parses ISO list, dedupes, includes "auto"', () {
+      final body = _loadFixture('getinfo_allmenu.xml');
+      final menu = parseAllMenu(body)!;
+      expect(menu.isoValues, isNotEmpty);
+      // "auto" must be the first ISO option offered.
+      expect(menu.isoValues.first, 'auto');
+      // Some standard ISO values must appear.
+      expect(menu.isoValues, contains('100'));
+      expect(menu.isoValues, contains('200'));
+      expect(menu.isoValues, contains('800'));
+      // Dedup: each value appears at most once.
+      final unique = menu.isoValues.toSet();
+      expect(unique.length, menu.isoValues.length);
+    });
+
+    test('ships hardcoded shutter list (allmenu does not enumerate)', () {
+      final body = _loadFixture('getinfo_allmenu.xml');
+      final menu = parseAllMenu(body)!;
+      expect(menu.shutterValues, defaultShutterValues);
+      // Bulb sentinel must be present.
+      expect(menu.shutterValues, contains('256/256'));
+    });
+  });
+
+  group('lumix_protocol — defaultShutterValues sanity', () {
+    test('all entries decode to plausible seconds (Bulb → infinity)', () {
+      for (final wire in defaultShutterValues) {
+        final s = shutterWireToSeconds(wire);
+        expect(s, isNotNull, reason: 'wire $wire failed to decode');
+        if (wire == '256/256') {
+          expect(s, double.infinity);
+        } else {
+          // 1/8192 s through ~30 s.
+          expect(s! > 0, true);
+          expect(s < 60, true);
+        }
+      }
     });
   });
 }

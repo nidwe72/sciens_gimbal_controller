@@ -279,18 +279,101 @@ String resultText(String body) {
 String _truncate(String s, int max) =>
     s.length <= max ? s : '${s.substring(0, max)}…';
 
-/// Parse a `getsetting&type=<T>` response. The Lumix XML wraps the
-/// returned value in `<settingvalue><T>VALUE</T></settingvalue>`.
-/// Returns the inner text of the first matching element, or null.
+/// Parse a `getsetting&type=<T>` response. The Lumix S5D returns
+/// the value as an **XML attribute** on the `<settingvalue>` element:
 ///
-/// TODO(fixtures): refine once we see the real S5 XML — element names
-/// may differ for some settings.
+/// ```xml
+/// <camrply>
+///   <result>ok</result>
+///   <settingvalue shtrspeed="2048/256"></settingvalue>
+/// </camrply>
+/// ```
+///
+/// Returns the attribute value, or null on parse failure / missing
+/// attribute.
 String? parseGetSetting(String body, String type) {
   try {
     final doc = XmlDocument.parse(body);
-    // Look for the most-specific element first.
-    final inner = doc.findAllElements(type).firstOrNull;
-    return inner?.innerText.trim();
+    final sv = doc.findAllElements('settingvalue').firstOrNull;
+    return sv?.getAttribute(type);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Sentinel `getsetting?type=focal` returns when no aperture data is
+/// available (lens not present, body in playback mode, etc.). `32767`
+/// is `0x7FFF` — the max signed int16, a classic "no value" marker.
+const String _apertureUnavailableWire = '32767/256';
+
+/// Decode a `<settingvalue focal="...">` attribute into an f-number.
+/// Returns null when the camera reports the no-data sentinel.
+double? apertureFromGetSetting(String body) {
+  final wire = parseGetSetting(body, 'focal');
+  if (wire == null) return null;
+  if (wire == _apertureUnavailableWire) return null;
+  return apertureWireToFNumber(wire);
+}
+
+/// A parsed `getstate` response. Used by PR 4's polling loop and the
+/// connection summary.
+///
+/// Field set is the subset that's broadly useful — the camera reports
+/// more (e.g. `<sd2_*>`, `<batt_grip>`, `<lens>`) but we only surface
+/// what the UI actually shows. Add as needed.
+class CameraState {
+  CameraState({
+    required this.cammode,
+    required this.battery,
+    required this.firmwareVersion,
+    required this.sdCardStatus,
+  });
+
+  /// Camera mode: usually `"rec"` (after `recmode`) or `"play"`.
+  final String cammode;
+
+  /// Battery indicator in "current/total" form, e.g. `"5/5"`.
+  final String battery;
+
+  /// Firmware version string, e.g. `"VD4.30"`.
+  final String firmwareVersion;
+
+  /// SD card status, e.g. `"write_enable"`, `"set"`, `"unset"`.
+  final String sdCardStatus;
+
+  bool get isRecMode => cammode == 'rec';
+  bool get isPlayMode => cammode == 'play';
+}
+
+/// Parse a `getstate` response into a [CameraState]. Returns null if
+/// the XML is malformed or doesn't contain a `<state>` block.
+///
+/// Schema (from the captured S5D fixture):
+/// ```xml
+/// <camrply>
+///   <result>ok</result>
+///   <state>
+///     <batt>5/5</batt>
+///     <cammode>play</cammode>
+///     <sdcardstatus>write_enable</sdcardstatus>
+///     <version>VD4.30</version>
+///     ...
+///   </state>
+/// </camrply>
+/// ```
+CameraState? parseGetState(String body) {
+  try {
+    final doc = XmlDocument.parse(body);
+    final state = doc.findAllElements('state').firstOrNull;
+    if (state == null) return null;
+    String inner(String tag) =>
+        state.findElements(tag).firstOrNull?.innerText.trim() ?? '';
+    return CameraState(
+      cammode: inner('cammode'),
+      battery: inner('batt'),
+      firmwareVersion: inner('version'),
+      sdCardStatus: inner('sdcardstatus'),
+    );
   } catch (_) {
     return null;
   }
@@ -324,47 +407,100 @@ bool isLumixDescriptor(String descriptorXml) {
   }
 }
 
-/// Allowed-values lists for shutter and ISO, extracted from a
-/// `getinfo?type=allmenu` response. The S5's actual XML schema is
-/// fixture-driven; the implementation here is a best-effort scaffold
-/// and will be refined when fixtures land.
+/// Allowed-values lists for shutter and ISO. ISO is extracted at
+/// runtime from `getinfo?type=allmenu` (44+ entries on the S5D). The
+/// stills shutter values are NOT enumerated in allmenu — only
+/// `shtrspeed_angle` (video angle mode) appears — so we ship a
+/// hardcoded standard list; the camera will reject anything it
+/// doesn't accept and the UI will surface the error.
 class AllMenu {
   AllMenu({required this.shutterValues, required this.isoValues});
 
-  /// Wire values (`<n>/256` strings) the body accepts for shutter.
+  /// Wire values (`<n>/256` strings, plus `256/256` for Bulb).
+  /// Sourced from [defaultShutterValues] — same list across bodies.
   final List<String> shutterValues;
 
   /// Wire values (`auto`, `100`, `200`, …) the body accepts for ISO.
+  /// Extracted from allmenu, deduplicated (some bodies emit both a
+  /// "100" and "L100" entry for the same wire value).
   final List<String> isoValues;
 }
 
-/// Best-effort scaffold parser. Real S5 schema verification TBD.
+/// Parse a `getinfo?type=allmenu` response and extract the ISO
+/// allowed-value list. The schema uses `<item>` elements with
+/// `cmd_mode="setsetting"` and `cmd_type="iso"`:
 ///
-/// TODO(fixtures): rewrite against the real schema once we capture
-/// a `getinfo_allmenu.xml` from the camera. The current shape just
-/// looks for `<setting>` elements that have a `type` attribute,
-/// then aggregates their `<value>` children. This may or may not
-/// match Panasonic's actual schema.
+/// ```xml
+/// <item id="menu_item_id_sensitivity_auto"
+///       cmd_mode="setsetting"
+///       cmd_type="iso"
+///       cmd_value="auto" />
+/// <item id="menu_item_id_sensitivity_100"
+///       cmd_mode="setsetting"
+///       cmd_type="iso"
+///       cmd_value="100" />
+/// ```
+///
+/// Shutter is paired with the hardcoded [defaultShutterValues] since
+/// `cmd_type="shtrspeed"` is absent from allmenu on this body.
 AllMenu? parseAllMenu(String body) {
   try {
     final doc = XmlDocument.parse(body);
-    final shutter = <String>[];
     final iso = <String>[];
-    for (final s in doc.findAllElements('setting')) {
-      final type = s.getAttribute('type');
-      if (type == 'shtrspeed') {
-        for (final v in s.findElements('value')) {
-          shutter.add(v.innerText.trim());
-        }
-      } else if (type == 'iso') {
-        for (final v in s.findElements('value')) {
-          iso.add(v.innerText.trim());
-        }
-      }
+    final seen = <String>{};
+    for (final item in doc.findAllElements('item')) {
+      if (item.getAttribute('cmd_mode') != 'setsetting') continue;
+      if (item.getAttribute('cmd_type') != 'iso') continue;
+      final v = item.getAttribute('cmd_value');
+      if (v == null) continue;
+      if (seen.add(v)) iso.add(v);
     }
-    if (shutter.isEmpty && iso.isEmpty) return null;
-    return AllMenu(shutterValues: shutter, isoValues: iso);
+    return AllMenu(
+      shutterValues: defaultShutterValues,
+      isoValues: iso,
+    );
   } catch (_) {
     return null;
   }
 }
+
+/// Standard shutter-speed wire values for setsetting `shtrspeed`.
+/// Wire format: `<numerator>/256`, where displayed seconds ≈
+/// `pow(2, -numerator/256)`. The Lumix protocol uses **exact
+/// powers of 2** for the wire values; the camera body maps these to
+/// the nearest standard 1/3-stop label for its on-screen display
+/// (e.g. wire `2048/256` = 1/256 s, displayed as "1/250").
+///
+/// Order: fastest → slowest, then Bulb last. Used by the camera
+/// tab's shutter dropdown when the body's allmenu doesn't enumerate
+/// stills shutter values (currently always — newer S-series).
+///
+/// If the camera rejects any of these on `setsetting`, the UI shows
+/// the error and the user picks a different one.
+const List<String> defaultShutterValues = <String>[
+  // Fast: 1/8192 down to 1/2.
+  '3328/256', // 1/8192 (≈ "1/8000")
+  '3072/256', // 1/4096 (≈ "1/4000")
+  '2816/256', // 1/2048 (≈ "1/2000")
+  '2560/256', // 1/1024 (≈ "1/1000")
+  '2304/256', // 1/512  (≈ "1/500")
+  '2048/256', // 1/256  (≈ "1/250")
+  '1792/256', // 1/128  (≈ "1/125")
+  '1536/256', // 1/64   (≈ "1/60")
+  '1280/256', // 1/32   (≈ "1/30")
+  '1024/256', // 1/16   (≈ "1/15")
+  '768/256',  // 1/8
+  '512/256',  // 1/4
+  // 256/256 is the BULB sentinel — skip the 1/2 slot to avoid the
+  // collision; the camera handles 1/2 via a non-power-of-2 wire
+  // value we don't expose here.
+  // Slow: 1 s and longer.
+  '0/256',     // 1 s
+  '-256/256',  // 2 s
+  '-512/256',  // 4 s
+  '-768/256',  // 8 s
+  '-1024/256', // 16 s
+  '-1280/256', // 30 s (approx)
+  // Bulb last.
+  '256/256',
+];
