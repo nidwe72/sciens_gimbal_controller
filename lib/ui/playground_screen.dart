@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../camera/camera_connection.dart';
 import '../state/gimbal_connection.dart';
 import 'connect_screen.dart';
 import 'header.dart';
+import 'tabs/camera_tab.dart';
 import 'tabs/controls_tab.dart';
 import 'tabs/logs_tab.dart';
 
@@ -28,7 +30,7 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
   }
 
   @override
@@ -74,6 +76,9 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
       canPop: false,
       onPopInvokedWithResult: (didPop, _) async {
         if (didPop) return;
+        // Disconnect both transports cleanly.
+        final cam = ref.read(cameraConnectionProvider);
+        await cam.disconnect();
         await conn.disconnect();
         if (context.mounted) {
           Navigator.of(context).pushReplacement(
@@ -91,6 +96,7 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
               controller: _tabController,
               tabs: const [
                 Tab(text: 'pan/tilt/roll'),
+                Tab(text: 'camera'),
                 Tab(text: 'logs'),
               ],
             ),
@@ -106,6 +112,7 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
                     onTiltDown: () => _move(pitch: -_stepDeg),
                     onLevel: _level,
                   ),
+                  const CameraTab(),
                   const LogsTab(),
                 ],
               ),

@@ -4,6 +4,14 @@
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- WiFi camera control (Phase 2): cam.cgi HTTP, SSDP multicast,
+         and bindProcessToNetwork to route traffic over the camera's AP
+         instead of cellular. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <application
         android:label="Sciens Gimbal Controller"
         android:name="${applicationName}"
