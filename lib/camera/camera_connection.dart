@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
+import 'jpeg_decoder.dart';
 import 'lumix_camera.dart';
 import 'lumix_protocol.dart';
+import 'mjpeg_udp_stream.dart';
 
 /// Connection-state machine for the Panasonic Lumix camera. Mirrors
 /// the gimbal-side `GimbalConnection` shape: a `ChangeNotifier`
@@ -33,6 +36,15 @@ class CameraConnection extends ChangeNotifier {
   String? _errorText;
   AllMenu? _caps;
 
+  // Live-preview state (PR 4).
+  MjpegUdpStream? _previewStream;
+  StreamSubscription<Uint8List>? _previewSub;
+  Timer? _previewKeepAlive;
+  bool _previewActive = false;
+  bool _previewPaused = false;
+  String? _previewError;
+  final _previewImage = ValueNotifier<ui.Image?>(null);
+
   CameraStatus get status => _status;
   String get statusText => _statusText;
   String? get errorText => _errorText;
@@ -40,6 +52,19 @@ class CameraConnection extends ChangeNotifier {
   /// Body-reported capabilities (allowed shutter / ISO lists). Null
   /// until `getinfo?type=allmenu` is parsed during connect.
   AllMenu? get caps => _caps;
+
+  /// True iff a live preview stream is currently active.
+  bool get previewActive => _previewActive;
+
+  /// Last error from a live-preview start or running stream. Cleared
+  /// on next successful start.
+  String? get previewError => _previewError;
+
+  /// Latest decoded frame from the live-preview stream. Widgets
+  /// should subscribe to this ValueListenable directly (e.g. via
+  /// `ValueListenableBuilder`) rather than rebuilding the whole tab
+  /// on each frame — frames arrive at ~5 fps by default.
+  ValueListenable<ui.Image?> get previewImage => _previewImage;
 
   bool get isConnected => _status == CameraStatus.connected;
   bool get isConnecting =>
@@ -155,9 +180,134 @@ class CameraConnection extends ChangeNotifier {
     }
   }
 
+  /// Start MJPEG live preview. Sends `startstream`, opens a UDP
+  /// listener on [udpPort], and starts publishing decoded frames
+  /// via [previewImage]. Returns true on success.
+  ///
+  /// Safe to call from a UI handler — failures set [previewError]
+  /// and return false, the caller is expected to surface that to
+  /// the user (typically by flipping the toggle back off).
+  Future<bool> startLivePreview({int udpPort = 49199}) async {
+    if (_status != CameraStatus.connected) {
+      _previewError = 'Not connected';
+      notifyListeners();
+      return false;
+    }
+    if (_previewActive) return true;
+    _previewError = null;
+
+    final camera = _camera;
+    if (camera == null) {
+      _previewError = 'No active camera handle';
+      notifyListeners();
+      return false;
+    }
+
+    MjpegUdpStream? stream;
+    try {
+      stream = await MjpegUdpStream.open(udpPort);
+      final body = await camera.startStream(udpPort);
+      if (!isResultOk(body)) {
+        await stream.close();
+        _previewError = 'Camera rejected startstream: ${resultText(body)}';
+        notifyListeners();
+        return false;
+      }
+    } on LumixException catch (e) {
+      await stream?.close();
+      _previewError = e.message;
+      notifyListeners();
+      return false;
+    } catch (e) {
+      await stream?.close();
+      _previewError = 'Could not start live preview: $e';
+      notifyListeners();
+      return false;
+    }
+
+    _previewStream = stream;
+    _previewSub = stream.jpegFrames.listen(
+      (jpeg) async {
+        if (_previewPaused) return;
+        try {
+          final image = await decodeJpeg(jpeg);
+          // Dispose the previous image so its GPU resources are freed.
+          _previewImage.value?.dispose();
+          _previewImage.value = image;
+        } catch (_) {
+          // Bad frame; skip. Next one is ~200 ms away.
+        }
+      },
+      onError: (_) {
+        // Socket-level error; the stop path will surface it.
+      },
+    );
+
+    // Keep-alive heartbeat. Lumix bodies time out the session if no
+    // cam.cgi command is sent for ~10 s, which manifests as the
+    // preview pane freezing on its last frame. liblumix's protocol
+    // notes call this out explicitly. We ping `getstate` at 1 Hz —
+    // cheap, idempotent, and read-only. PR 5's full polling loop
+    // will replace this with the same cadence carrying more reads.
+    _previewKeepAlive = Timer.periodic(const Duration(seconds: 1),
+        (_) async {
+      final cam = _camera;
+      if (cam == null || !_previewActive) return;
+      try {
+        await cam.getState();
+      } catch (_) {
+        // Best effort; missed pings will manifest as a freeze, which
+        // is already the failure mode this guards against.
+      }
+    });
+
+    _previewActive = true;
+    notifyListeners();
+    return true;
+  }
+
+  /// Stop the MJPEG live preview. Tears down the local UDP listener
+  /// and asks the camera to stop streaming. Safe to call when no
+  /// preview is active (no-op in that case).
+  Future<void> stopLivePreview() async {
+    final wasActive = _previewActive;
+    _previewActive = false;
+    _previewKeepAlive?.cancel();
+    _previewKeepAlive = null;
+    await _previewSub?.cancel();
+    _previewSub = null;
+    await _previewStream?.close();
+    _previewStream = null;
+    _previewImage.value?.dispose();
+    _previewImage.value = null;
+
+    if (wasActive) {
+      final camera = _camera;
+      if (camera != null) {
+        try {
+          await camera.stopStream();
+        } catch (_) {
+          // Best effort.
+        }
+      }
+    }
+    notifyListeners();
+  }
+
+  /// Pause/resume frame decoding while keeping the camera streaming
+  /// and the UDP socket draining. Used by the UI when the camera tab
+  /// is offscreen — saves CPU without renegotiating the stream.
+  /// Datagrams continue to be read (so the kernel buffer doesn't
+  /// fill up) and rate-limited, but the decode step is skipped.
+  void setPreviewPaused(bool paused) {
+    if (_previewPaused == paused) return;
+    _previewPaused = paused;
+  }
+
   /// Disconnect: polite-goodbye sequence via the transport, plus
   /// state-machine reset.
   Future<void> disconnect() async {
+    await stopLivePreview();
     final camera = _camera;
     if (camera != null) {
       try {
@@ -174,6 +324,7 @@ class CameraConnection extends ChangeNotifier {
   /// Tear down + record the error text + set state = error. Used by
   /// the connect path on any failure.
   Future<void> _failTo(String message) async {
+    await stopLivePreview();
     final camera = _camera;
     if (camera != null) {
       try {
@@ -194,7 +345,13 @@ class CameraConnection extends ChangeNotifier {
 
   @override
   void dispose() {
-    _camera?.disconnect(streaming: false);
+    // Best-effort teardown; we don't await since dispose is sync.
+    _previewKeepAlive?.cancel();
+    _previewSub?.cancel();
+    _previewStream?.close();
+    _previewImage.value?.dispose();
+    _previewImage.dispose();
+    _camera?.disconnect(streaming: _previewActive);
     super.dispose();
   }
 }

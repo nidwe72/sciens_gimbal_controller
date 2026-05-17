@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -49,6 +51,12 @@ class _CameraTabState extends ConsumerState<CameraTab>
   Widget build(BuildContext context) {
     super.build(context);
     final conn = ref.watch(cameraConnectionProvider);
+
+    // Pause-decode when the tab is hidden. TickerMode goes false on
+    // the inactive tab(s) of a TabBarView, so we ride that signal
+    // rather than wiring up a VisibilityDetector. Datagrams keep
+    // draining; only the JPEG decode is skipped.
+    conn.setPreviewPaused(!TickerMode.valuesOf(context).enabled);
 
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -214,15 +222,45 @@ class _ConnectingView extends StatelessWidget {
       };
 }
 
-class _ConnectedView extends StatelessWidget {
+class _ConnectedView extends StatefulWidget {
   const _ConnectedView({required this.conn, required this.onDisconnect});
   final CameraConnection conn;
   final VoidCallback onDisconnect;
 
   @override
+  State<_ConnectedView> createState() => _ConnectedViewState();
+}
+
+class _ConnectedViewState extends State<_ConnectedView> {
+  bool _previewToggle = false;
+  bool _toggleBusy = false;
+
+  Future<void> _onTogglePreview(bool value) async {
+    if (_toggleBusy) return;
+    setState(() => _toggleBusy = true);
+    if (value) {
+      final ok = await widget.conn.startLivePreview();
+      if (!mounted) return;
+      setState(() {
+        _previewToggle = ok;
+        _toggleBusy = false;
+      });
+    } else {
+      await widget.conn.stopLivePreview();
+      if (!mounted) return;
+      setState(() {
+        _previewToggle = false;
+        _toggleBusy = false;
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final caps = conn.caps;
+    final conn = widget.conn;
+    // Surface preview errors from the underlying connection state.
+    final previewError = conn.previewError;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -243,39 +281,76 @@ class _ConnectedView extends StatelessWidget {
               ),
             ),
             TextButton.icon(
-              onPressed: onDisconnect,
+              onPressed: widget.onDisconnect,
               icon: const Icon(Icons.link_off, size: 18),
               label: const Text('Disconnect'),
             ),
           ],
         ),
         const Divider(height: 24),
-        Text(
-          'Connected — controls land in PR 4.',
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
-          ),
+        // PR 4: live-preview toggle + preview pane.
+        SwitchListTile(
+          value: _previewToggle,
+          onChanged: _toggleBusy ? null : _onTogglePreview,
+          title: const Text('Live preview'),
+          contentPadding: EdgeInsets.zero,
+          dense: true,
         ),
-        if (caps != null) ...[
-          const SizedBox(height: 8),
+        if (previewError != null) ...[
+          const SizedBox(height: 4),
           Text(
-            'Capabilities cached: '
-            '${caps.shutterValues.length} shutter values, '
-            '${caps.isoValues.length} ISO values.',
+            previewError,
             style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
-            ),
-          ),
-        ] else ...[
-          const SizedBox(height: 8),
-          Text(
-            'Capabilities not yet parsed — fixtures pending.',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+              color: theme.colorScheme.error,
             ),
           ),
         ],
+        if (_previewToggle) ...[
+          const SizedBox(height: 8),
+          _PreviewPane(conn: conn),
+        ],
       ],
+    );
+  }
+}
+
+class _PreviewPane extends StatelessWidget {
+  const _PreviewPane({required this.conn});
+  final CameraConnection conn;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AspectRatio(
+      aspectRatio: 4 / 3,
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: theme.colorScheme.outlineVariant,
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        alignment: Alignment.center,
+        child: ValueListenableBuilder<ui.Image?>(
+          valueListenable: conn.previewImage,
+          builder: (context, image, _) {
+            if (image == null) {
+              return Text(
+                'Waiting for frames...',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: Colors.white70,
+                ),
+              );
+            }
+            return RawImage(
+              image: image,
+              fit: BoxFit.contain,
+            );
+          },
+        ),
+      ),
     );
   }
 }
