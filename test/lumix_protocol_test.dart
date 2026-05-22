@@ -464,4 +464,69 @@ void main() {
       expect(nearestApertureWire(null), null);
     });
   });
+
+  group('lumix_protocol — recmode & battery', () {
+    test('parseRecmode pulls the current mode from a curmenu body', () {
+      const body = '<menuinfo>'
+          '<item id="menu_item_id_recmode" enable="no" value="shutter_ae" />'
+          '<item id="menu_item_id_recmode_shutter_ae" enable="yes" />'
+          '</menuinfo>';
+      expect(parseRecmode(body), 'shutter_ae');
+      expect(parseRecmode('<menuinfo></menuinfo>'), isNull);
+    });
+
+    test('parseRecmode is not fooled by longer recmode_* ids', () {
+      const body =
+          '<item id="menu_item_id_recmode_aperture_ae" enable="yes" />'
+          '<item id="menu_item_id_recmode" value="aperture_ae" />';
+      expect(parseRecmode(body), 'aperture_ae');
+    });
+
+    test('batteryBars parses the N/M form', () {
+      expect(batteryBars('3/5'), 3);
+      expect(batteryBars('0/5'), 0);
+      expect(batteryBars('5/5'), 5);
+      expect(batteryBars(null), isNull);
+      expect(batteryBars(''), isNull);
+      expect(batteryBars('-1'), isNull);
+    });
+  });
+
+  group('lumix_protocol — EV compensation', () {
+    test('evThirds parses integer and n/3 forms', () {
+      expect(evThirds('0'), 0);
+      expect(evThirds('5'), 15);
+      expect(evThirds('-4'), -12);
+      expect(evThirds('-14/3'), -14);
+      expect(evThirds('11/3'), 11);
+      expect(evThirds('xyz'), isNull);
+    });
+
+    test('evLabel formats 1/3-stop EV values', () {
+      expect(evLabel('0'), '0');
+      expect(evLabel('5'), '+5');
+      expect(evLabel('-5'), '-5');
+      expect(evLabel('-14/3'), '-4⅔');
+      expect(evLabel('-13/3'), '-4⅓');
+      expect(evLabel('1/3'), '+⅓');
+      expect(evLabel('-1/3'), '-⅓');
+    });
+
+    test('nearestExposureWire matches across integer / n-3 forms', () {
+      // Polled "-12/3" must snap to the listed integer "-4" (same EV).
+      expect(nearestExposureWire('-12/3', const ['-5', '-4', '0']), '-4');
+      expect(nearestExposureWire('0', const ['-5', '0', '5']), '0');
+      expect(nearestExposureWire(null, const ['0']), isNull);
+      expect(nearestExposureWire('0', const []), isNull);
+    });
+
+    test('parseAllMenu extracts a sorted exposure list (S5D fixture)', () {
+      final menu = parseAllMenu(_loadFixture('getinfo_allmenu.xml'));
+      expect(menu, isNotNull);
+      expect(menu!.exposureValues, contains('0'));
+      expect(menu.exposureValues.length, greaterThan(20));
+      final evs = menu.exposureValues.map(evThirds).whereType<int>().toList();
+      expect(evs, [...evs]..sort());
+    });
+  });
 }

@@ -1353,7 +1353,7 @@ current session (no persistence across launches).
 
 ```
 ┌─ camera tab ────────────────────────────────────┐
-│  Lumix S5            [ Disconnect ]              │
+│  Lumix S5  [▰▰▰▱▱]   [ Disconnect ]              │
 │  ──────────────────────────────────────────────  │
 │  ☐ Live preview                                  │
 │  ┌────────────────────────────────────────────┐  │
@@ -1362,7 +1362,7 @@ current session (no persistence across launches).
 │  │                                            │  │
 │  └────────────────────────────────────────────┘  │
 │  ──────────────────────────────────────────────  │
-│  Mode (set on dial): [ P ] [ A ] [ S ] [ M ]     │
+│  Mode (from camera): [ P ] [ A ] [ S ] [ M ]     │
 │  ──────────────────────────────────────────────  │
 │  Shutter:  [ 1/125  ▼ ]                          │
 │  ISO:      [ 400    ▼ ]                          │
@@ -1379,18 +1379,17 @@ current session (no persistence across launches).
   collapses the pane. The checkbox is the only functional control in
   PR 4; everything below it (mode hint, shutter / ISO / aperture
   rows, Capture button) lands in PR 5.
-- **Mode hint — segmented selector** (`P / A / S / M`). Pure
-  client-side state. Selecting a chip sends nothing over the wire —
-  it just tells the app which dial position the user has set on the
-  camera body. Lumix `cam.cgi` exposes no setter for the shooting
-  mode and no reader for the dial position (confirmed against the
-  S5D `allmenu` fixture — no `cmd_type` for it; the C3 custom-bank
-  trick is USB/PTP-only and not present on the WiFi protocol on this
-  firmware), so the user is the source of truth. **No default
-  selection on connect**: until the user taps one of the four chips,
-  all controls below remain read-only. Session-only — resets to "no
-  selection" on reconnect. The selector is always visible (not
-  hidden behind any toggle).
+- **Mode readout — `P / A / S / M`** (read-only). The camera's
+  shooting mode *is* readable — `curmenu` reports it as
+  `menu_item_id_recmode`'s `value` attribute, and a lighter
+  `getsetting?type=recmode` path is to be confirmed (PR 7). The
+  polling loop reads it and lights the matching chip; the segmented
+  control is a **read-only display, not a selector** — the S5's mode
+  dial is mechanical and exposes no setter. The mode drives the
+  control-enablement matrix below. A camera mode outside `P/A/S/M`
+  (intelligent-auto, video, a custom bank) lights no chip and leaves
+  every control read-only. *(PR 5 shipped this as a manual,
+  session-only hint; PR 7 turns it into the live readout.)*
 
   Mode → control enablement matrix (combines with the aperture
   sentinel below):
@@ -2270,9 +2269,10 @@ Edits:
     during the countdown — tapping it aborts the firing.
     Independent of any panorama-phase settle-delay (Phase 4 will
     have its own).
-- `lib/camera/camera_connection.dart` — `setEvCompensation(value)`
-  helper. The polling loop doesn't need to read EV — last-set
-  value is fine since EV is rarely changed on-body.
+- `lib/camera/camera_connection.dart` — EV is applied through the
+  existing `applySetting('exposure', …)`; and, unlike the original
+  plan, the poll loop **does** read it (a 4th `getsetting` in the
+  1 Hz cycle) so the dropdown tracks the body's EV dial.
 
 Tests:
 - `test/camera_connection_test.dart` extends — EV setter calls the
@@ -2286,10 +2286,97 @@ Verifies on hardware:
   shutter fires after 5 s. Tapping Cancel during countdown:
   no shot fires.
 
+#### PR 6 — as built (EV compensation)
+
+The EV-compensation half shipped; the single-shot self-timer is the
+remaining PR 6 piece.
+
+Deviations from the plan:
+- **EV is polled.** The plan said the poll loop needn't read EV. It
+  does — a 4th `getsetting` in the 1 Hz cycle — so the dropdown
+  tracks EV dialled on the body, consistent with shutter / ISO /
+  aperture.
+- **No `setEvCompensation` helper** — EV is applied via the generic
+  `applySetting('exposure', …)` and the row is a plain
+  `_SettingDropdownRow` (pending-value + error UX reused).
+- `parseAllMenu` was extended to also collect `cmd_type="exposure"`,
+  sorted ascending; `evThirds` / `evLabel` / `nearestExposureWire`
+  helpers added. Labels use the conventional 1/3-stop form
+  ("−4⅔", "0", "+1⅓"). `nearestExposureWire` matches by EV value,
+  so the integer and `n/3` wire forms resolve either way.
+
+Verified on hardware: EV editable in P/A/S, read-only in M, and the
+dropdown tracks the body's EV dial.
+
+#### PR 7 — Mode readout + battery indicator
+
+Two camera-tab refinements found after PR 5 shipped. Independent of
+PR 6 — they can land in either order.
+
+**Reading the mode.** The mode is available from `curmenu` as
+`menu_item_id_recmode`'s `value` attribute (`program_ae` /
+`aperture_ae` / `shutter_ae` / `manual_exposure` / `ia` /
+`creative_movie` / `slow_quick` / `c1`…`c12`). A lighter
+`getsetting?type=recmode` was probed on the bench and returned
+`err_critical` (like `type=lens`) — there is no lightweight getter.
+`curmenu` is ~45 KB, so it is read on a **slow cadence** — every
+~5 s (every 5th poll cycle), not at 1 Hz — and only the
+`menu_item_id_recmode` value is extracted from it.
+
+**Mode readout.** The `P/A/S/M` segmented control becomes a
+**read-only readout** — no longer tappable. The polling loop reads
+the mode and lights the matching chip; a camera mode outside
+`P/A/S/M` (IA / video / custom bank) lights no chip and leaves every
+control read-only. The enablement matrix is now driven by the
+camera's actual mode, not a manual guess. There is no mode *setter*
+— the S5's dial is mechanical (confirmed). This replaces PR 5's
+manual session-only hint.
+
+**Battery indicator.** A Material battery icon in the Connected-view
+header, beside the camera name, filled to the `<batt>` level —
+`getstate` reports a **0–5 bar count**, and `<batt_per>` is always
+`-1` over WiFi, so there is no true percentage. Colour by level:
+**1/5 or lower → red, 2/5 → amber, 3/5 and up → default**. The value
+is already parsed (`CameraState.battery`).
+
+Edits: `lumix_protocol.dart` (recmode parse + `CameraMode` mapping,
+`<batt>` level parse), `camera_connection.dart` (poll the mode),
+`camera_tab.dart` (selector → readout, header battery icon),
+`camera_diagnostics.dart` (the `recmode` probe in the baseline
+batch).
+
+Verifies on hardware:
+- Turn the mode dial through P / A / S / M — the readout chip
+  follows within ~5 s (the `curmenu` read cadence), and shutter /
+  aperture editability changes with it.
+- A non-P/A/S/M dial position (IA, a custom bank) lights no chip.
+- The battery icon reflects the on-body bar level and goes red at
+  the last bar.
+
+#### PR 7 — as built
+
+Shipped and verified on the S5D.
+
+- **Mode readout.** `getsetting?type=recmode` was probed and returned
+  `err_critical`, so the mode is read from `curmenu` instead — every
+  5th poll cycle (~5 s), `parseRecmode` regex-extracts the
+  `menu_item_id_recmode` value. The `P/A/S/M` control is now
+  `_ModeReadout`, a read-only 4-chip row driven by `conn.recMode`
+  via `cameraModeFromRecmode`; the manual selector and `_modeHint`
+  state are gone. A non-P/A/S/M mode lights no chip and leaves the
+  controls read-only.
+- **Battery indicator.** A Material battery icon in the
+  Connected-view header, filled to the `<batt>` bar level
+  (`batteryBars`), coloured red ≤1/5 / amber 2/5 / default above.
+  No percentage — `<batt_per>` is always `-1` over WiFi.
+
+Verified on hardware: the readout chip follows the mode dial, and
+shutter / aperture editability changes with it.
+
 #### Sign-off
 
-After PR 6 lands and all on-hardware verification checkpoints above
-pass, Phase 2 is complete. Move to Phase 3 (protocol library
+After PR 6 and PR 7 land and all on-hardware verification
+checkpoints above pass, Phase 2 is complete. Move to Phase 3 (protocol library
 extraction) or Phase 4 (panorama sequencer) — order optional.
 
 ### Out of scope (Phase 2)

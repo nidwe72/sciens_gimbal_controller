@@ -136,6 +136,8 @@ class CameraDiagnostics extends ChangeNotifier {
             0, 'getsetting_focal', {'mode': 'getsetting', 'type': 'focal'});
         await _capture(0, 'getsetting_exposure',
             {'mode': 'getsetting', 'type': 'exposure'});
+        await _capture(0, 'getsetting_recmode',
+            {'mode': 'getsetting', 'type': 'recmode'});
         await _capture(
             0, 'getinfo_allmenu', {'mode': 'getinfo', 'type': 'allmenu'});
         await _capture(

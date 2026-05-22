@@ -16,6 +16,7 @@ class _FakeCamera {
   String shutter = '1792/256';
   String iso = '400';
   String focal = '1024/256';
+  String exposure = '0';
 
   static const _ok =
       '<?xml version="1.0"?><camrply><result>ok</result></camrply>';
@@ -29,6 +30,10 @@ class _FakeCamera {
       '<menuinfo>'
       '<item cmd_mode="setsetting" cmd_type="iso" cmd_value="auto"/>'
       '<item cmd_mode="setsetting" cmd_type="iso" cmd_value="400"/>'
+      '</menuinfo></camrply>';
+  static const _curmenu = '<?xml version="1.0"?><camrply><result>ok</result>'
+      '<menuinfo>'
+      '<item id="menu_item_id_recmode" enable="no" value="aperture_ae" />'
       '</menuinfo></camrply>';
 
   String _settingValue(String type, String value) =>
@@ -45,13 +50,15 @@ class _FakeCamera {
       case 'accctrl':
         return http.Response(rejectAccctrl ? _err : _ok, 200);
       case 'getinfo':
-        return http.Response(_allmenu, 200);
+        return http.Response(
+            q['type'] == 'curmenu' ? _curmenu : _allmenu, 200);
       case 'getsetting':
         final type = q['type'] ?? '';
         final value = switch (type) {
           'shtrspeed' => shutter,
           'iso' => iso,
           'focal' => focal,
+          'exposure' => exposure,
           _ => '0',
         };
         return http.Response(_settingValue(type, value), 200);
@@ -122,7 +129,16 @@ void main() {
       expect(conn.isoWire, '400');
       expect(conn.focalWire, '1024/256');
       expect(conn.cameraState?.remainCapacity, 2438);
+      expect(conn.exposureWire, '0');
 
+      await conn.disconnect();
+    });
+
+    test('the poll reads the shooting mode from curmenu', () async {
+      final conn = makeConn(_FakeCamera());
+      await conn.connect(manualIp: '192.168.54.1');
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(conn.recMode, 'aperture_ae');
       await conn.disconnect();
     });
 

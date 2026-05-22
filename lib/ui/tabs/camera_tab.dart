@@ -30,6 +30,22 @@ bool _isoEditable(CameraMode? m) => m != null;
 bool _apertureEditable(CameraMode? m) =>
     m == CameraMode.a || m == CameraMode.m;
 
+/// Maps the camera's raw `recmode` string to a `CameraMode`, or null
+/// for modes outside P/A/S/M (intelligent-auto, video, custom banks).
+CameraMode? cameraModeFromRecmode(String? recmode) => switch (recmode) {
+      'program_ae' => CameraMode.p,
+      'aperture_ae' => CameraMode.a,
+      'shutter_ae' => CameraMode.s,
+      'manual_exposure' => CameraMode.m,
+      _ => null,
+    };
+
+/// EV compensation is user-settable in P / A / S; read-only in M (no
+/// auto-exposure offset when shutter and aperture are both user-set)
+/// and when no mode is known.
+bool _evEditable(CameraMode? m) =>
+    m == CameraMode.p || m == CameraMode.a || m == CameraMode.s;
+
 /// Shutter dropdown options — the 19 hardcoded wires paired with
 /// human labels. Built once.
 final List<({String wire, String display})> _shutterOptions = [
@@ -324,10 +340,6 @@ class _ConnectedViewState extends State<_ConnectedView> {
   bool _previewToggle = false;
   bool _toggleBusy = false;
 
-  /// Dial-position hint. Null until the user picks — session-only,
-  /// resets on reconnect (this State is rebuilt fresh).
-  CameraMode? _modeHint;
-
   Future<void> _onTogglePreview(bool value) async {
     if (_toggleBusy) return;
     setState(() => _toggleBusy = true);
@@ -352,11 +364,16 @@ class _ConnectedViewState extends State<_ConnectedView> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final conn = widget.conn;
+    final mode = cameraModeFromRecmode(conn.recMode);
     // Surface preview errors from the underlying connection state.
     final previewError = conn.previewError;
     final isoValues = conn.caps?.isoValues ?? const <String>[];
     final isoOptions = [
       for (final v in isoValues) (wire: v, display: v),
+    ];
+    final exposureValues = conn.caps?.exposureValues ?? const <String>[];
+    final evOptions = [
+      for (final v in exposureValues) (wire: v, display: evLabel(v)),
     ];
     final shutterWire = nearestShutterWire(conn.shutterWire);
     final shutterLabel = shutterWire == null
@@ -384,6 +401,8 @@ class _ConnectedViewState extends State<_ConnectedView> {
                 ],
               ),
             ),
+            _BatteryIcon(battery: conn.cameraState?.battery),
+            const SizedBox(width: 4),
             TextButton.icon(
               onPressed: widget.onDisconnect,
               icon: const Icon(Icons.link_off, size: 18),
@@ -414,23 +433,20 @@ class _ConnectedViewState extends State<_ConnectedView> {
           _PreviewPane(conn: conn),
         ],
         const Divider(height: 24),
-        _ModeHintSelector(
-          mode: _modeHint,
-          onChanged: (m) => setState(() => _modeHint = m),
-        ),
+        _ModeReadout(mode: mode),
         const SizedBox(height: 12),
         _SettingDropdownRow(
           label: 'Shutter',
           options: _shutterOptions,
           selectedWire: shutterWire,
-          editable: _shutterEditable(_modeHint),
+          editable: _shutterEditable(mode),
           onApply: (w) => conn.applySetting('shtrspeed', w),
         ),
         _SettingDropdownRow(
           label: 'ISO',
           options: isoOptions,
           selectedWire: _snapIso(conn.isoWire, isoValues),
-          editable: _isoEditable(_modeHint) && isoValues.isNotEmpty,
+          editable: _isoEditable(mode) && isoValues.isNotEmpty,
           onApply: (w) => conn.applySetting('iso', w),
         ),
         if (conn.focalWire == apertureSentinelWire)
@@ -440,9 +456,17 @@ class _ConnectedViewState extends State<_ConnectedView> {
             label: 'Aperture',
             options: _apertureOptions,
             selectedWire: nearestApertureWire(conn.focalWire),
-            editable: _apertureEditable(_modeHint),
+            editable: _apertureEditable(mode),
             onApply: (w) => conn.applySetting('focal', w),
           ),
+        _SettingDropdownRow(
+          label: 'EV',
+          options: evOptions,
+          selectedWire:
+              nearestExposureWire(conn.exposureWire, exposureValues),
+          editable: _evEditable(mode) && exposureValues.isNotEmpty,
+          onApply: (w) => conn.applySetting('exposure', w),
+        ),
         const SizedBox(height: 20),
         _CaptureButton(conn: conn, shutterLabel: shutterLabel),
       ],
@@ -450,14 +474,20 @@ class _ConnectedViewState extends State<_ConnectedView> {
   }
 }
 
-/// `P / A / S / M` segmented selector for the dial-position hint.
-/// Empty (no default) on connect; the controls below stay read-only
-/// until a mode is chosen.
-class _ModeHintSelector extends StatelessWidget {
-  const _ModeHintSelector({required this.mode, required this.onChanged});
+/// Read-only `P / A / S / M` mode readout — reflects the camera's dial
+/// position (polled from `curmenu`). Not interactive: the S5's mode
+/// dial is mechanical and exposes no setter.
+class _ModeReadout extends StatelessWidget {
+  const _ModeReadout({required this.mode});
 
   final CameraMode? mode;
-  final ValueChanged<CameraMode?> onChanged;
+
+  static String _label(CameraMode m) => switch (m) {
+        CameraMode.p => 'P',
+        CameraMode.a => 'A',
+        CameraMode.s => 'S',
+        CameraMode.m => 'M',
+      };
 
   @override
   Widget build(BuildContext context) {
@@ -465,25 +495,20 @@ class _ModeHintSelector extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Mode (set on dial)', style: theme.textTheme.bodySmall),
+        Text('Mode (from camera)', style: theme.textTheme.bodySmall),
         const SizedBox(height: 6),
-        SegmentedButton<CameraMode>(
-          segments: const [
-            ButtonSegment(value: CameraMode.p, label: Text('P')),
-            ButtonSegment(value: CameraMode.a, label: Text('A')),
-            ButtonSegment(value: CameraMode.s, label: Text('S')),
-            ButtonSegment(value: CameraMode.m, label: Text('M')),
+        Row(
+          children: [
+            for (final m in CameraMode.values) ...[
+              _ModeChip(label: _label(m), active: m == mode),
+              if (m != CameraMode.values.last) const SizedBox(width: 6),
+            ],
           ],
-          selected: mode == null ? const <CameraMode>{} : {mode!},
-          emptySelectionAllowed: true,
-          showSelectedIcon: false,
-          onSelectionChanged: (sel) =>
-              onChanged(sel.isEmpty ? null : sel.first),
         ),
         if (mode == null) ...[
           const SizedBox(height: 6),
           Text(
-            'Pick the dial position to enable the controls.',
+            'Camera is not in P / A / S / M — controls are read-only.',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
             ),
@@ -491,6 +516,75 @@ class _ModeHintSelector extends StatelessWidget {
         ],
       ],
     );
+  }
+}
+
+/// One chip in the mode readout — filled when it is the active mode.
+class _ModeChip extends StatelessWidget {
+  const _ModeChip({required this.label, required this.active});
+
+  final String label;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: 40,
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: active ? theme.colorScheme.primary : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Text(
+        label,
+        style: theme.textTheme.labelLarge?.copyWith(
+          color: active
+              ? theme.colorScheme.onPrimary
+              : theme.colorScheme.onSurface.withValues(alpha: 0.5),
+          fontWeight: active ? FontWeight.bold : FontWeight.normal,
+        ),
+      ),
+    );
+  }
+}
+
+/// Camera battery level as a Material icon — red at 0–1/5, amber at
+/// 2/5, default above. The camera reports a 0–5 bar count, not a
+/// percentage (`<batt_per>` is always -1 over WiFi).
+class _BatteryIcon extends StatelessWidget {
+  const _BatteryIcon({required this.battery});
+
+  /// The `<batt>` value, e.g. "3/5", or null before the first poll.
+  final String? battery;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final bars = batteryBars(battery);
+    if (bars == null) {
+      return Icon(
+        Icons.battery_unknown,
+        size: 22,
+        color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
+      );
+    }
+    final icon = switch (bars) {
+      <= 0 => Icons.battery_0_bar,
+      1 => Icons.battery_1_bar,
+      2 => Icons.battery_2_bar,
+      3 => Icons.battery_3_bar,
+      4 => Icons.battery_4_bar,
+      _ => Icons.battery_full,
+    };
+    final color = switch (bars) {
+      <= 1 => theme.colorScheme.error,
+      2 => Colors.amber.shade800,
+      _ => theme.colorScheme.onSurface,
+    };
+    return Icon(icon, size: 22, color: color);
   }
 }
 

@@ -60,10 +60,13 @@ class CameraConnection extends ChangeNotifier {
   // preview-only heartbeat) and feeds the controls.
   bool _polling = false;
   int _pollFailCount = 0;
+  int _pollCycle = 0;
   CameraState? _cameraState;
   String? _shutterWire;
   String? _isoWire;
   String? _focalWire;
+  String? _exposureWire;
+  String? _recMode;
 
   CameraStatus get status => _status;
   String get statusText => _statusText;
@@ -108,6 +111,11 @@ class CameraConnection extends ChangeNotifier {
   String? get shutterWire => _shutterWire;
   String? get isoWire => _isoWire;
   String? get focalWire => _focalWire;
+  String? get exposureWire => _exposureWire;
+
+  /// Raw camera shooting mode (`shutter_ae`, `aperture_ae`, …), read
+  /// from `curmenu` every ~5 s. Null until the first read.
+  String? get recMode => _recMode;
 
   /// Connect lifecycle (per SPEC Phase 2 "Connect-time and
   /// disconnect-time orderings"):
@@ -371,6 +379,7 @@ class CameraConnection extends ChangeNotifier {
     if (_polling) return;
     _polling = true;
     _pollFailCount = 0;
+    _pollCycle = 0;
     _pollLoop();
   }
 
@@ -414,7 +423,7 @@ class CameraConnection extends ChangeNotifier {
     _cameraState = state;
     _pollFailCount = 0;
 
-    for (final type in const ['shtrspeed', 'iso', 'focal']) {
+    for (final type in const ['shtrspeed', 'iso', 'focal', 'exposure']) {
       if (!_polling) return;
       try {
         final value = parseGetSetting(await camera.getSetting(type), type);
@@ -426,12 +435,27 @@ class CameraConnection extends ChangeNotifier {
               _isoWire = value;
             case 'focal':
               _focalWire = value;
+            case 'exposure':
+              _exposureWire = value;
           }
         }
       } catch (_) {
         // Tolerated — the value stays stale until the next cycle.
       }
     }
+
+    // Every 5th cycle, refresh the shooting mode from curmenu
+    // (~45 KB — too heavy for 1 Hz; the dial changes rarely).
+    if (_polling && _pollCycle % 5 == 0) {
+      try {
+        final mode = parseRecmode(
+            await camera.rawGet({'mode': 'getinfo', 'type': 'curmenu'}));
+        if (mode != null) _recMode = mode;
+      } catch (_) {
+        // Tolerated — the mode stays stale until the next cycle.
+      }
+    }
+    _pollCycle++;
     if (_polling) notifyListeners();
   }
 

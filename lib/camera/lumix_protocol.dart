@@ -408,6 +408,29 @@ CameraState? parseGetState(String body) {
   }
 }
 
+/// Extract the current shooting mode from a `getinfo?type=curmenu`
+/// response — the `value` of the `menu_item_id_recmode` item
+/// (`program_ae` / `aperture_ae` / `shutter_ae` / `manual_exposure` /
+/// `ia` / `creative_movie` / `slow_quick` / `c1`…). Returns null if
+/// the item is absent. A regex, not a full XML parse — `curmenu` is
+/// ~45 KB and only one attribute is needed. The closing quote after
+/// `recmode` keeps it from matching `menu_item_id_recmode_*` items.
+String? parseRecmode(String curMenuBody) {
+  final m = RegExp(r'id="menu_item_id_recmode"[^>]*?value="([^"]*)"')
+      .firstMatch(curMenuBody);
+  return m?.group(1);
+}
+
+/// The battery bar count from `getstate`'s `<batt>` value, which is in
+/// `"N/M"` form (e.g. `"3/5"`). Returns N, or null if [batt] is null,
+/// empty, or malformed. `<batt_per>` is always `-1` over WiFi, so the
+/// bar count is the only level the camera gives.
+int? batteryBars(String? batt) {
+  if (batt == null) return null;
+  final m = RegExp(r'^(\d+)/(\d+)$').firstMatch(batt.trim());
+  return m == null ? null : int.parse(m.group(1)!);
+}
+
 /// Tags identifying a UPnP device descriptor as a Panasonic Lumix
 /// camera. Used by the SSDP-discovery code in `lumix_camera.dart`.
 bool isLumixDescriptor(String descriptorXml) {
@@ -443,7 +466,11 @@ bool isLumixDescriptor(String descriptorXml) {
 /// hardcoded standard list; the camera will reject anything it
 /// doesn't accept and the UI will surface the error.
 class AllMenu {
-  AllMenu({required this.shutterValues, required this.isoValues});
+  AllMenu({
+    required this.shutterValues,
+    required this.isoValues,
+    required this.exposureValues,
+  });
 
   /// Wire values (`<n>/256` strings, plus `256/256` for Bulb).
   /// Sourced from [defaultShutterValues] — same list across bodies.
@@ -453,6 +480,10 @@ class AllMenu {
   /// Extracted from allmenu, deduplicated (some bodies emit both a
   /// "100" and "L100" entry for the same wire value).
   final List<String> isoValues;
+
+  /// EV-compensation wire values (`-5` … `5` in 1/3-stop steps, as
+  /// `n` or `n/3`), extracted from allmenu and sorted ascending.
+  final List<String> exposureValues;
 }
 
 /// Parse a `getinfo?type=allmenu` response and extract the ISO
@@ -476,17 +507,27 @@ AllMenu? parseAllMenu(String body) {
   try {
     final doc = XmlDocument.parse(body);
     final iso = <String>[];
-    final seen = <String>{};
+    final isoSeen = <String>{};
+    final exposure = <String>[];
+    final exposureSeen = <String>{};
     for (final item in doc.findAllElements('item')) {
       if (item.getAttribute('cmd_mode') != 'setsetting') continue;
-      if (item.getAttribute('cmd_type') != 'iso') continue;
       final v = item.getAttribute('cmd_value');
       if (v == null) continue;
-      if (seen.add(v)) iso.add(v);
+      switch (item.getAttribute('cmd_type')) {
+        case 'iso':
+          if (isoSeen.add(v)) iso.add(v);
+        case 'exposure':
+          if (exposureSeen.add(v)) exposure.add(v);
+      }
     }
+    // EV values are numeric — sort ascending so the dropdown runs
+    // -5 → +5 regardless of allmenu document order.
+    exposure.sort((a, b) => (evThirds(a) ?? 0).compareTo(evThirds(b) ?? 0));
     return AllMenu(
       shutterValues: defaultShutterValues,
       isoValues: iso,
+      exposureValues: exposure,
     );
   } catch (_) {
     return null;
@@ -612,6 +653,64 @@ String? nearestApertureWire(String? polled) {
     if (f == null) continue;
     final dist = (f - target).abs();
     if (dist < bestDist) {
+      bestDist = dist;
+      best = wire;
+    }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// EV compensation. Wire values from allmenu `cmd_type="exposure"`: an
+// integer `n` (whole EV) or `n/3` (1/3-stop). Range −5 … +5 EV.
+// ---------------------------------------------------------------------------
+
+/// An EV-compensation wire value as a numerator over 3 — `"-14/3"` →
+/// −14, `"-4"` → −12, `"0"` → 0, `"5"` → 15. Null if [wire] is not an
+/// integer or `n/3` form.
+int? evThirds(String wire) {
+  final w = wire.trim();
+  final thirds = RegExp(r'^(-?\d+)/3$').firstMatch(w);
+  if (thirds != null) return int.parse(thirds.group(1)!);
+  final whole = RegExp(r'^(-?\d+)$').firstMatch(w);
+  if (whole != null) return int.parse(whole.group(1)!) * 3;
+  return null;
+}
+
+/// Human label for an EV-compensation wire value — conventional
+/// 1/3-stop form: `"0"`, `"+5"`, `"-4⅔"`, `"+⅓"`. The whole/fraction
+/// split is computed on the *absolute* numerator (Dart's `%` on a
+/// negative misleads). Falls back to the raw [wire] if unparseable.
+String evLabel(String wire) {
+  final n = evThirds(wire);
+  if (n == null) return wire;
+  if (n == 0) return '0';
+  final m = n.abs();
+  final whole = m ~/ 3;
+  final frac = switch (m % 3) {
+    1 => '⅓',
+    2 => '⅔',
+    _ => '',
+  };
+  final wholeStr = (whole == 0 && frac.isNotEmpty) ? '' : '$whole';
+  return '${n < 0 ? '-' : '+'}$wholeStr$frac';
+}
+
+/// The [options] entry whose EV value is closest to [polled], compared
+/// via [evThirds] — so the integer and `n/3` wire forms match whichever
+/// the camera echoes. Null if [polled] is null/undecodable or [options]
+/// is empty.
+String? nearestExposureWire(String? polled, List<String> options) {
+  if (polled == null) return null;
+  final target = evThirds(polled);
+  if (target == null) return null;
+  String? best;
+  var bestDist = -1;
+  for (final wire in options) {
+    final n = evThirds(wire);
+    if (n == null) continue;
+    final dist = (n - target).abs();
+    if (bestDist < 0 || dist < bestDist) {
       bestDist = dist;
       best = wire;
     }
