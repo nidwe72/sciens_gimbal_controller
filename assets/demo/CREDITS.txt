@@ -1,0 +1,7 @@
+Demo camera image — assets/demo/architecture.jpg (and architecture_b.jpg,
+a brightness-tweaked variant used for the live-preview flicker).
+
+Photo by Erik Heddema on Unsplash — https://unsplash.com/photos/7qheceNIy7k
+Used under the Unsplash License (free use, no attribution required).
+Sourced via Lorem Picsum (picsum.photos), image id 522.
+Modified: cropped to 3:2 and converted to black & white.

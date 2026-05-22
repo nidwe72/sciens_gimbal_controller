@@ -86,21 +86,25 @@ class _CameraTabState extends ConsumerState<CameraTab>
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    final isDemo = ref.watch(
+        cameraConnectionProvider.select((c) => c.isDemo));
     return DefaultTabController(
-      length: 2,
+      length: isDemo ? 3 : 2,
       child: Column(
-        children: const [
+        children: [
           TabBar(
             tabs: [
-              Tab(text: 'Camera'),
-              Tab(text: 'Debug/Diagnostics'),
+              const Tab(text: 'Camera'),
+              const Tab(text: 'Debug/Diagnostics'),
+              if (isDemo) const Tab(text: 'Virtual S5'),
             ],
           ),
           Expanded(
             child: TabBarView(
               children: [
-                _CameraControlsTab(),
-                CameraDiagnosticsView(),
+                const _CameraControlsTab(),
+                const CameraDiagnosticsView(),
+                if (isDemo) const _VirtualLumixTab(),
               ],
             ),
           ),
@@ -135,13 +139,13 @@ class _CameraControlsTabState extends ConsumerState<_CameraControlsTab>
     super.dispose();
   }
 
-  Future<void> _connect({String? manualIp}) async {
+  Future<void> _connect({String? manualIp, bool demo = false}) async {
     final conn = ref.read(cameraConnectionProvider);
-    final ok = await conn.connect(manualIp: manualIp);
+    final ok = await conn.connect(manualIp: manualIp, demo: demo);
     if (!ok && mounted) {
       // If auto-discovery failed, surface the manual-IP entry row
       // so the user can retry with an explicit IP.
-      if (manualIp == null) {
+      if (manualIp == null && !demo) {
         setState(() => _showManualIp = true);
       }
     }
@@ -179,6 +183,7 @@ class _CameraControlsTabState extends ConsumerState<_CameraControlsTab>
               onConnectManual: () => _connect(
                 manualIp: _manualIpController.text.trim(),
               ),
+              onConnectDemo: () => _connect(demo: true),
             ),
           CameraStatus.discovering ||
           CameraStatus.registering ||
@@ -202,6 +207,7 @@ class _DisconnectedView extends StatelessWidget {
     required this.onToggleManualIp,
     required this.onConnect,
     required this.onConnectManual,
+    required this.onConnectDemo,
   });
 
   final CameraConnection conn;
@@ -210,6 +216,7 @@ class _DisconnectedView extends StatelessWidget {
   final VoidCallback onToggleManualIp;
   final VoidCallback onConnect;
   final VoidCallback onConnectManual;
+  final VoidCallback onConnectDemo;
 
   @override
   Widget build(BuildContext context) {
@@ -221,6 +228,12 @@ class _DisconnectedView extends StatelessWidget {
           onPressed: onConnect,
           icon: const Icon(Icons.link),
           label: const Text('Connect to camera'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: onConnectDemo,
+          icon: const Icon(Icons.science_outlined),
+          label: const Text('Demo Lumix S5'),
         ),
         const SizedBox(height: 16),
         Text(
@@ -1068,6 +1081,89 @@ class _FullScreenImageState extends State<_FullScreenImage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The "Virtual Lumix S5" sub-tab (PR 9 Step 6) — stands in for the
+/// camera body's physical controls. Visible only when the demo
+/// transport is the active connection. Writes go straight to the
+/// `DemoLumixCamera`'s virtual state; the next poll cycle propagates
+/// them to the camera tab's mode chip and battery indicator.
+class _VirtualLumixTab extends ConsumerStatefulWidget {
+  const _VirtualLumixTab();
+
+  @override
+  ConsumerState<_VirtualLumixTab> createState() =>
+      _VirtualLumixTabState();
+}
+
+class _VirtualLumixTabState extends ConsumerState<_VirtualLumixTab> {
+  /// Mode dial — recmode wire value paired with its dial-letter label.
+  static const _modes = <(String, String)>[
+    ('program_ae', 'P'),
+    ('aperture_ae', 'A'),
+    ('shutter_ae', 'S'),
+    ('manual_exposure', 'M'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final demo = ref.read(cameraConnectionProvider).demoCamera;
+    if (demo == null) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'These controls stand in for the camera body — set them '
+              'as if you were turning the mode dial or watching the '
+              'battery drain. Changes show on the Camera tab on the '
+              'next poll.',
+              style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 24),
+            Text('Mode dial', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: SegmentedButton<String>(
+                segments: _modes
+                    .map((m) => ButtonSegment<String>(
+                          value: m.$1,
+                          label: Text(m.$2),
+                        ))
+                    .toList(),
+                selected: {demo.dialMode},
+                onSelectionChanged: (s) =>
+                    setState(() => demo.dialMode = s.first),
+                showSelectedIcon: false,
+              ),
+            ),
+            const SizedBox(height: 24),
+            Row(
+              children: [
+                Text('Battery', style: theme.textTheme.titleMedium),
+                const Spacer(),
+                Text('${demo.batteryBars} / 5 bars',
+                    style: theme.textTheme.bodyMedium),
+              ],
+            ),
+            Slider(
+              value: demo.batteryBars.toDouble(),
+              min: 0,
+              max: 5,
+              divisions: 5,
+              label: '${demo.batteryBars}',
+              onChanged: (v) =>
+                  setState(() => demo.batteryBars = v.round()),
+            ),
+          ],
+        ),
       ),
     );
   }

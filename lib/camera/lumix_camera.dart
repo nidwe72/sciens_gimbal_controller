@@ -5,7 +5,9 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
+import 'camera_transport.dart';
 import 'lumix_protocol.dart';
+import 'mjpeg_udp_stream.dart';
 
 /// Transport layer: speaks the `cam.cgi` HTTP protocol against a
 /// Lumix camera on its WiFi access point. Owns the FIFO request queue
@@ -20,7 +22,7 @@ import 'lumix_protocol.dart';
 ///
 /// See SPEC-flutter-app.md Phase 2.
 
-class LumixCamera {
+class LumixCamera implements CameraTransport {
   LumixCamera({
     this.httpTimeout = const Duration(seconds: 5),
     http.Client? httpClient,
@@ -54,8 +56,15 @@ class LumixCamera {
   final http.Client _httpClient;
   final _HttpRequestQueue _queue = _HttpRequestQueue();
 
+  /// MJPEG live-preview plumbing. The transport owns the UDP socket so
+  /// a demo transport can substitute its own frame source.
+  MjpegUdpStream? _previewSocket;
+  StreamSubscription<Uint8List>? _previewSocketSub;
+  final _previewFramesCtrl = StreamController<Uint8List>.broadcast();
+
   /// Set after a successful [discover] (or after the manual fallback).
   String? _cameraIp;
+  @override
   String? get cameraIp => _cameraIp;
 
   /// True once [bind] has been called (and not yet undone by [unbind]).
@@ -66,6 +75,7 @@ class LumixCamera {
   /// Bind the process to a WiFi network and acquire the multicast
   /// lock for SSDP. Must be called before any HTTP / SSDP work. See
   /// SPEC Phase 2 "Connect-time and disconnect-time orderings".
+  @override
   Future<void> bind() async {
     if (_bound) return;
     try {
@@ -97,6 +107,7 @@ class LumixCamera {
   ///
   /// Must be called *after* [bind] so the SSDP M-SEARCH and the
   /// probe both route over WiFi.
+  @override
   Future<String?> discover() async {
     final ssdp = _discoverViaSsdp().catchError((_) => null);
     final probe = _probe(defaultCameraIp).then((ok) => ok ? defaultCameraIp : null);
@@ -130,6 +141,7 @@ class LumixCamera {
   /// Manually point the camera at a user-entered IP, bypassing
   /// discovery. Verifies the IP responds to `getstate` before
   /// accepting it.
+  @override
   Future<bool> useManualIp(String ip) async {
     final ok = await _probe(ip);
     if (ok) _cameraIp = ip;
@@ -231,49 +243,98 @@ class LumixCamera {
 
   // --- HTTP endpoints. All go through the FIFO queue.
 
+  @override
   Future<String> accCtrl() => _request(
         urlAccCtrl(_requireIp()),
         timeout: _accCtrlTimeout,
       );
 
+  @override
   Future<String> recMode() => _request(urlRecMode(_requireIp()));
 
   Future<String> playMode() => _request(urlPlayMode(_requireIp()));
 
+  @override
   Future<String> getState() => _request(urlGetState(_requireIp()));
 
+  @override
   Future<String> getInfoAllMenu() =>
       _request(urlGetInfoAllMenu(_requireIp()));
 
+  @override
   Future<String> getSetting(String type) =>
       _request(urlGetSetting(_requireIp(), type));
 
+  @override
   Future<String> setSetting(String type, String value) =>
       _request(urlSetSetting(_requireIp(), type, value));
 
+  @override
   Future<String> capture() => _request(urlCapture(_requireIp()));
 
   Future<String> captureCancel() =>
       _request(urlCaptureCancel(_requireIp()));
 
-  Future<String> startStream(int udpPort) =>
-      _request(urlStartStream(_requireIp(), udpPort));
+  /// Decoded MJPEG live-preview frames (raw JPEG bytes), broadcast.
+  @override
+  Stream<Uint8List> get previewFrames => _previewFramesCtrl.stream;
 
-  Future<String> stopStream() => _request(urlStopStream(_requireIp()));
+  @override
+  Future<String> startStream(int udpPort) async {
+    // Open the local UDP listener first so it is ready before the
+    // camera starts pushing frames.
+    await _closePreviewSocket();
+    final socket = await MjpegUdpStream.open(udpPort);
+    _previewSocket = socket;
+    _previewSocketSub = socket.jpegFrames.listen(
+      (frame) {
+        if (!_previewFramesCtrl.isClosed) _previewFramesCtrl.add(frame);
+      },
+      onError: (_) {
+        // Socket-level error; the stop path surfaces preview failures.
+      },
+    );
+    try {
+      final body = await _request(urlStartStream(_requireIp(), udpPort));
+      // Camera refused — don't leave the local socket open.
+      if (!isResultOk(body)) await _closePreviewSocket();
+      return body;
+    } catch (_) {
+      await _closePreviewSocket();
+      rethrow;
+    }
+  }
+
+  @override
+  Future<String> stopStream() async {
+    await _closePreviewSocket();
+    return _request(urlStopStream(_requireIp()));
+  }
+
+  /// Tear down the live-preview UDP listener. Idempotent.
+  Future<void> _closePreviewSocket() async {
+    await _previewSocketSub?.cancel();
+    _previewSocketSub = null;
+    await _previewSocket?.close();
+    _previewSocket = null;
+  }
 
   /// Issue an arbitrary `cam.cgi` request built from [query]. Goes
   /// through the same FIFO queue as the typed endpoints above. Used by
   /// the diagnostics tool to probe endpoints the typed API omits.
+  @override
   Future<String> rawGet(Map<String, String> query) =>
       _request(urlRaw(_requireIp(), query));
 
   /// GET an arbitrary absolute URL (not necessarily `cam.cgi`) through
   /// the FIFO queue — used to probe the UPnP ContentDirectory.
+  @override
   Future<String> rawGetUrl(String url) => _request(url);
 
   /// GET an arbitrary URL and return the raw bytes (no UTF-8 decode)
   /// through the FIFO queue — used to fetch captured JPEGs. [timeout]
   /// overrides [httpTimeout] (the full-res JPEG needs more headroom).
+  @override
   Future<Uint8List> rawGetBytes(String url, {Duration? timeout}) {
     return _queue.enqueue(() async {
       try {
@@ -299,6 +360,7 @@ class LumixCamera {
 
   /// POST a SOAP request through the FIFO queue. [soapAction] is the
   /// bare action; it is quoted into the `SOAPAction` header.
+  @override
   Future<String> soapPost(String url, String soapAction, String body) {
     return _queue.enqueue(() async {
       try {
@@ -333,6 +395,7 @@ class LumixCamera {
   /// Returns the raw response datagrams — the diagnostics probe uses
   /// them to discover UPnP descriptor (`LOCATION`) URLs. Best-effort:
   /// returns whatever arrived.
+  @override
   Future<List<String>> ssdpProbe({
     Duration window = const Duration(seconds: 3),
   }) async {
@@ -425,9 +488,13 @@ class LumixCamera {
   ///   5. close HTTP client
   ///
   /// Steps 2 and 3 swallow errors — we're tearing down anyway.
+  @override
   Future<void> disconnect({bool streaming = false}) async {
     // 1. Drop any in-flight + queued work.
     _queue.cancel();
+
+    // Tear down the live-preview socket.
+    await _closePreviewSocket();
 
     // 2 + 3. Polite goodbye (these need the WiFi binding so they must
     // run before unbind()). Best-effort.
@@ -452,6 +519,7 @@ class LumixCamera {
     // 5. Close transport.
     _httpClient.close();
     _cameraIp = null;
+    if (!_previewFramesCtrl.isClosed) await _previewFramesCtrl.close();
   }
 }
 

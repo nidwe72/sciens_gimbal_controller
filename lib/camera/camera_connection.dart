@@ -4,11 +4,12 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
+import 'camera_transport.dart';
+import 'demo_lumix_camera.dart';
 import 'jpeg_decoder.dart';
 import 'lumix_camera.dart';
 import 'lumix_content.dart';
 import 'lumix_protocol.dart';
-import 'mjpeg_udp_stream.dart';
 
 /// Connection-state machine for the Panasonic Lumix camera. Mirrors
 /// the gimbal-side `GimbalConnection` shape: a `ChangeNotifier`
@@ -29,7 +30,7 @@ enum CameraStatus {
 
 class CameraConnection extends ChangeNotifier {
   CameraConnection({
-    LumixCamera Function()? cameraFactory,
+    CameraTransport Function()? cameraFactory,
     Duration pollInterval = const Duration(seconds: 1),
   })  : _cameraFactory = cameraFactory ?? LumixCamera.new,
         _pollInterval = pollInterval;
@@ -37,19 +38,18 @@ class CameraConnection extends ChangeNotifier {
   /// Builds the transport for each connect attempt. Injectable so
   /// `camera_connection_test.dart` can supply a `LumixCamera` wired to
   /// a mock `http.Client`.
-  final LumixCamera Function() _cameraFactory;
+  final CameraTransport Function() _cameraFactory;
 
   /// Gap between poll cycles — overridable so tests run fast.
   final Duration _pollInterval;
 
-  LumixCamera? _camera;
+  CameraTransport? _camera;
   CameraStatus _status = CameraStatus.disconnected;
   String _statusText = 'Disconnected';
   String? _errorText;
   AllMenu? _caps;
 
   // Live-preview state (PR 4).
-  MjpegUdpStream? _previewStream;
   StreamSubscription<Uint8List>? _previewSub;
   bool _previewActive = false;
   bool _previewPaused = false;
@@ -107,6 +107,14 @@ class CameraConnection extends ChangeNotifier {
   /// connection-summary line.
   String? get cameraIp => _camera?.cameraIp;
 
+  /// True when the active transport is the simulated Demo Lumix S5.
+  bool get isDemo => _camera is DemoLumixCamera;
+
+  /// The demo transport's virtual camera body, or null on a real
+  /// camera. The "Virtual Lumix S5" tab drives this.
+  DemoLumixCamera? get demoCamera =>
+      _camera is DemoLumixCamera ? _camera as DemoLumixCamera : null;
+
   /// Latest parsed `getstate` from the 1 Hz poll, or null before the
   /// first cycle completes.
   CameraState? get cameraState => _cameraState;
@@ -148,12 +156,12 @@ class CameraConnection extends ChangeNotifier {
   /// Returns true on success. On any failure, the connection is torn
   /// down via [_failTo] and the method returns false; [errorText] is
   /// set so the UI can display it.
-  Future<bool> connect({String? manualIp}) async {
+  Future<bool> connect({String? manualIp, bool demo = false}) async {
     if (_status != CameraStatus.disconnected && _status != CameraStatus.error) {
       return false;
     }
     _errorText = null;
-    final camera = _cameraFactory();
+    final camera = demo ? DemoLumixCamera() : _cameraFactory();
     _camera = camera;
 
     try {
@@ -269,30 +277,24 @@ class CameraConnection extends ChangeNotifier {
       return false;
     }
 
-    MjpegUdpStream? stream;
     try {
-      stream = await MjpegUdpStream.open(udpPort);
       final body = await camera.startStream(udpPort);
       if (!isResultOk(body)) {
-        await stream.close();
         _previewError = 'Camera rejected startstream: ${resultText(body)}';
         notifyListeners();
         return false;
       }
     } on LumixException catch (e) {
-      await stream?.close();
       _previewError = e.message;
       notifyListeners();
       return false;
     } catch (e) {
-      await stream?.close();
       _previewError = 'Could not start live preview: $e';
       notifyListeners();
       return false;
     }
 
-    _previewStream = stream;
-    _previewSub = stream.jpegFrames.listen(
+    _previewSub = camera.previewFrames.listen(
       (jpeg) async {
         if (_previewPaused) return;
         try {
@@ -324,8 +326,6 @@ class CameraConnection extends ChangeNotifier {
     _previewActive = false;
     await _previewSub?.cancel();
     _previewSub = null;
-    await _previewStream?.close();
-    _previewStream = null;
     _previewImage.value?.dispose();
     _previewImage.value = null;
 
@@ -489,7 +489,7 @@ class CameraConnection extends ChangeNotifier {
   /// but takes no photo) and the MJPEG stream. Re-assert record mode,
   /// and bounce live preview if it was running. Clears
   /// [fetchInProgress] when done. Best-effort throughout.
-  Future<void> _restoreAfterContentAccess(LumixCamera camera) async {
+  Future<void> _restoreAfterContentAccess(CameraTransport camera) async {
     try {
       try {
         await camera.recMode();
@@ -580,9 +580,10 @@ class CameraConnection extends ChangeNotifier {
       }
     }
 
-    // Every 5th cycle, refresh the shooting mode from curmenu
-    // (~45 KB — too heavy for 1 Hz; the dial changes rarely).
-    if (_polling && _pollCycle % 5 == 0) {
+    // Refresh the shooting mode from curmenu. The real curmenu is
+    // ~45 KB — too heavy for 1 Hz, so every 5th cycle. The demo's is
+    // cheap, so every cycle — the Virtual tab's dial feels instant.
+    if (_polling && _pollCycle % (isDemo ? 1 : 5) == 0) {
       try {
         final mode = parseRecmode(
             await camera.rawGet({'mode': 'getinfo', 'type': 'curmenu'}));
@@ -649,7 +650,6 @@ class CameraConnection extends ChangeNotifier {
     // Best-effort teardown; we don't await since dispose is sync.
     _stopPolling();
     _previewSub?.cancel();
-    _previewStream?.close();
     _previewImage.value?.dispose();
     _previewImage.dispose();
     _capturedImage.value?.dispose();

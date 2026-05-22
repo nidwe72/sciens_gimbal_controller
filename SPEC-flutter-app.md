@@ -2474,19 +2474,155 @@ capture; repeated capture, live-preview and full-screen cycles all
 hold up; the full-screen viewer is centered and fills the screen in
 both orientations.
 
+#### PR 9 — Demo Lumix S5 (virtual camera)
+
+**Goal.** Run the entire camera UX — connect, controls, capture,
+image review, live preview — with **no real camera**, exactly the way
+the Demo Gimbal runs the gimbal UX with no SCORP C2. For showcasing
+the app, for development away from the S5D, and for emulators with no
+WiFi radio.
+
+**Behavior model — observable parity, not firmware fidelity.** Same
+principle as `DemoGimbalTransport`: the demo reproduces the *result
+the user sees* once the app has worked around the real camera's
+quirks. It does **not** re-enact the record/playback-mode hostility
+(PR 8's content-access bug) — `recmode` / `playmode` / `capture` /
+`Browse` are simply accepted and always behave. Capture always
+shoots; the content server always serves.
+
+**"Retain the traffic."** The demo fakes only the **transport** — no
+real HTTP, UDP, SSDP or `WifiNetworkChannel`. It synthesizes the
+exact `cam.cgi` XML, the DIDL-Lite SOAP, and the JPEG frame bytes a
+real S5D returns, so every layer above the transport runs unchanged:
+the `lumix_protocol.dart` parsers, `CameraConnection`, `LumixContent`,
+`jpeg_decoder`. This mirrors `DemoGimbalTransport` speaking the AK
+protocol byte-for-byte.
+
+**The seam — `CameraTransport`.** Today `LumixCamera` *is* the
+transport (HTTP client + FIFO queue + discovery + `WifiNetworkChannel`
++ the `cam.cgi` endpoints + SOAP + raw GETs + SSDP). Extract its
+public surface into an abstract `CameraTransport`:
+
+- `LumixCamera implements CameraTransport` — the real HTTP
+  implementation, unchanged in behavior.
+- `DemoLumixCamera implements CameraTransport` — the new simulator.
+
+`CameraConnection`, `LumixContent` and the diagnostics delegates
+retarget from `LumixCamera` to `CameraTransport`. The `_cameraFactory`
+becomes `CameraTransport Function()` — tests still pass a `LumixCamera`
+factory unchanged.
+
+**Live-preview seam.** `MjpegUdpStream` is currently opened directly
+by `CameraConnection`. Move that behind the transport: `CameraTransport`
+owns `startStream` / `stopStream` and exposes the decoded **JPEG-frame
+stream**. `LumixCamera` wraps `MjpegUdpStream` internally;
+`DemoLumixCamera` emits its synthetic frames (the two alternating
+variants). `CameraConnection` consumes the transport's frame stream
+rather than constructing a socket.
+
+**The virtual body.** `DemoLumixCamera` holds the state a real S5's
+body and card would hold:
+
+- **Shooting mode** — P / A / S / M; drives `getstate` and the
+  `curmenu` recmode readout.
+- **Battery level** — 0–5 bars; drives the battery indicator.
+- **Current exposure settings** — shutter / ISO / aperture / EV-comp;
+  sensible defaults, updated when the app sends `setsetting`.
+- **Capability lists** — the shutter / ISO / aperture values the body
+  reports via a synthesized `getinfo?type=allmenu`; hardcoded to the
+  real S5D's lists (PR 5 / PR 6 verified them) or otherwise sensible.
+- **SD card** — a hardcoded, always-ample free-shot count that
+  decrements by one per capture (so the capture button's
+  decrement-detection works). No "card full" state.
+- **Captured shots** — a virtual ContentDirectory list; each capture
+  appends an entry. `Browse` returns it; the `:50001` URLs resolve to
+  the bundled image.
+
+**The "Virtual Lumix S5" tab.** A tab shown **only while the demo
+camera is connected** (hidden for a real camera and when
+disconnected). It stands in for the camera body's physical controls,
+letting the user set the **mode dial** (P / A / S / M) and the
+**battery level**. Writes go to `DemoLumixCamera`'s virtual state;
+the poll picks them up, so the camera tab's mode readout and battery
+indicator update through the normal path — no extra wiring. So the
+dial change shows promptly (rather than after ~5 s), the poll fetches
+`curmenu` **every cycle in demo mode** — `_pollCycle % (isDemo ? 1 :
+5)`; the real every-5th-cycle gate exists only because the real
+`curmenu` is a heavy ~45 KB download, which the demo's is not.
+
+**The synthetic image.** A bundled architectural photo
+(freely-licensed, converted to **black & white**) at a resolution
+that holds up under full-screen zoom — this is the captured still,
+served for both the `JPEG_SM` and `JPEG_LRG` resource URLs. For the
+live-preview flicker, two **downscaled** variants of the same shot
+are bundled alongside it: a clean copy and one with a subtle
+brightness/grain tweak. Live preview **alternates the two preview
+variants** on successive frames at ~5 Hz so the feed reads as
+*somewhat live* — a gentle shimmer — rather than a frozen frame. The
+downscale + variant difference are baked in at asset-prep time; no
+runtime image processing. Each asset is kept **≤ 2 MB** — they are
+committed to the repo.
+
+**Selecting the demo.** A **"Demo Lumix S5"** entry in the camera
+tab's connect view, beside the real connect controls — analogous to
+the Demo Gimbal row in the gimbal connect screen. It calls
+`CameraConnection.connect(demo: true)`, which builds a
+`DemoLumixCamera`. The demo's connect lifecycle fakes `bind` /
+discovery / `accctrl` / `getstate` / `setsetting` / `recmode` /
+`allmenu` with short phase delays, like `DemoGimbalTransport`'s
+`_phaseDelay`.
+
+**Out of scope for the demo.** No SD-card-full state; no error
+injection; one architectural shot (its two preview variants aside) —
+no image library.
+
+**Implementation steps.**
+
+1. **`CameraTransport` interface.** Extract it from `LumixCamera`;
+   `LumixCamera implements` it; retarget `CameraConnection`,
+   `LumixContent`, diagnostics. Pure refactor — all existing tests
+   stay green.
+2. **Preview-frame seam.** Move `MjpegUdpStream` ownership into
+   `LumixCamera`; `CameraTransport` exposes the frame stream;
+   `CameraConnection` consumes it.
+3. **`DemoLumixCamera` core + connect entry.** The virtual body +
+   wire-format synthesis for connect, the poll, controls and capture
+   (`accctrl`, `getstate`, `getinfo allmenu`, `getsetting` /
+   `setsetting`, `recmode`, `curmenu`, `camcmd capture`). Wire up
+   `connect(demo: true)` and add the **"Demo Lumix S5" connect
+   button** to the camera connect view — so Steps 3–5 are each
+   on-device testable. Connect / controls / capture work in demo.
+4. **Demo image pipeline.** Bundle the architectural JPEG; synthesize
+   SSDP / descriptor / SOAP `Browse`; serve the asset bytes for the
+   `:50001` URLs. Inline + full-screen review work in demo.
+5. **Demo live preview.** Bundle the two downscaled preview variants;
+   alternate them at ~5 Hz so the feed reads as live.
+6. **UI — the "Virtual Lumix S5" tab.** A third sub-tab of the Camera
+   tab (mode dial + battery), shown only in demo mode.
+7. **Tests.** The demo's synthesized wire formats round-trip through
+   the real parsers (`parseGetState`, `parseAllMenu`,
+   `parseBrowseResult`, `parseRecmode`); capture decrements capacity;
+   mode / battery changes surface on the next poll.
+
+Verified: 113 unit tests round-trip every demo wire format through
+the real parsers (`isResultOk`, `parseGetState`, `parseAllMenu`,
+`parseGetSetting`, `parseRecmode`, `extractSsdpLocation`,
+`findContentDirectory`, `parseBrowseResult`), plus the full
+`LumixContent.fetchLatest()` chain against the demo. On-device, the
+Demo Lumix S5 connects, controls + capture work, the still and the
+full-screen viewer show the bundled black-and-white photo, and the
+live preview shimmers. The Virtual Lumix S5 tab's mode dial and
+battery slider drive the camera tab's readouts via the normal poll
+path.
+
 #### Sign-off
 
-After PR 6, PR 7 and PR 8 land and all on-hardware verification
+After PR 6, PR 7, PR 8 and PR 9 land and all on-hardware verification
 checkpoints above pass, Phase 2 is complete. Move to Phase 3 (protocol library
 extraction) or Phase 4 (panorama sequencer) — order optional.
 
 ### Out of scope (Phase 2)
 
-- **Demo camera transport.** Explicitly postponed. If/when added, it
-  will follow the same transport-interface pattern we used for the
-  gimbal (`GimbalTransport` / `BleGimbalTransport` /
-  `DemoGimbalTransport`), introducing a `CameraTransport` abstract
-  interface at that time.
 - Same-network mode (camera joins user's existing WiFi).
 - Manual exposure mode switching (P/A/S/M selection — the dial on
   the camera body handles this).

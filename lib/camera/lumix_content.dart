@@ -1,6 +1,6 @@
 import 'package:xml/xml.dart';
 
-import 'lumix_camera.dart';
+import 'camera_transport.dart';
 
 /// One image entry from the camera's UPnP ContentDirectory.
 class ContentImage {
@@ -116,7 +116,7 @@ String browseSoapEnvelope(
 class LumixContent {
   LumixContent(this._camera);
 
-  final LumixCamera _camera;
+  final CameraTransport _camera;
   ({String controlUrl, String serviceType})? _cd;
 
   /// SSDP-discover the ContentDirectory control URL. Cached after the
