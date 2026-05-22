@@ -4,7 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../camera/camera_connection.dart';
 import '../../camera/camera_diagnostics.dart';
 
-/// The Debug/Diagnostics sub-tab: an eight-step `Stepper` wizard that
+/// The Debug/Diagnostics sub-tab: a nine-step `Stepper` wizard that
 /// captures real rec-mode camera responses and exposes them over the
 /// in-app HTTP server. See SPEC Phase 2, *Pre-PR 5*.
 class CameraDiagnosticsView extends ConsumerStatefulWidget {
@@ -167,9 +167,26 @@ class _CameraDiagnosticsViewState extends ConsumerState<CameraDiagnosticsView>
           ),
         ),
         Step(
-          title: const Text('Review & export'),
-          state: diag.currentStep == 7 ? StepState.editing : StepState.indexed,
+          title: const Text('ContentDirectory probe'),
+          state: _stepState(diag, 7),
           isActive: diag.currentStep == 7,
+          content: _captureStep(
+            instruction:
+                'Probes the camera\'s image-content server (UPnP, port '
+                '60606): captures the device descriptor and SOAP Browse '
+                'responses, to work out how a captured photo is fetched. '
+                'Make sure at least one photo is on the card.',
+            step: 7,
+            connected: connected,
+            diag: diag,
+            runLabel: 'Run ContentDirectory probe',
+            onRun: () => diag.runContentDirectoryProbe(),
+          ),
+        ),
+        Step(
+          title: const Text('Review & export'),
+          state: diag.currentStep == 8 ? StepState.editing : StepState.indexed,
+          isActive: diag.currentStep == 8,
           content: _reviewStep(diag),
         ),
       ],

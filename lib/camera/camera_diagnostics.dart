@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
+import 'package:xml/xml.dart';
 
 import 'camera_connection.dart';
 import 'lumix_protocol.dart';
@@ -55,7 +56,7 @@ class CameraDiagnostics extends ChangeNotifier {
 
   /// HTTP-server port and the last wizard step index.
   static const int kPort = 8080;
-  static const int kLastStep = 7;
+  static const int kLastStep = 8;
 
   static const MethodChannel _nsdChannel =
       MethodChannel('at.sciens.gimbal_controller/nsd');
@@ -244,6 +245,143 @@ class CameraDiagnostics extends ChangeNotifier {
             {'mode': 'setsetting', 'type': 'focal', 'value': '1024/256'});
       });
 
+  /// Step 8 — UPnP ContentDirectory probe. Captures the camera's
+  /// MediaServer device descriptor and SOAP `Browse` responses so PR 8
+  /// (captured-image review) can be specced. Run connected, with at
+  /// least one photo on the card.
+  Future<void> runContentDirectoryProbe() => _runStep(() async {
+        final conn = _ref.read(cameraConnectionProvider);
+        if (!conn.isConnected) return;
+
+        // 1. SSDP M-SEARCH — the descriptor URL is a reply's LOCATION
+        // header, not a fixed path. Capture every (unique) reply.
+        List<String> replies;
+        try {
+          replies = (await conn.diagnosticSsdpProbe()).toSet().toList();
+        } catch (e) {
+          _snapshots.add(DiagnosticSnapshot(
+              step: 7,
+              name: 'ssdp_error',
+              request: 'M-SEARCH ssdp:all',
+              timestamp: DateTime.now(),
+              error: e.toString()));
+          notifyListeners();
+          return;
+        }
+        _snapshots.add(DiagnosticSnapshot(
+            step: 7,
+            name: 'ssdp_replies',
+            request: 'M-SEARCH ssdp:all (${replies.length} unique)',
+            timestamp: DateTime.now(),
+            body: replies.isEmpty
+                ? '(no SSDP replies)'
+                : replies.join('\n--- reply ---\n')));
+        notifyListeners();
+
+        // 2. GET every advertised descriptor (LOCATION header).
+        final locations = <String>{};
+        for (final r in replies) {
+          final loc = _extractLocation(r);
+          if (loc != null) locations.add(loc);
+        }
+        ({String controlUrl, String serviceType})? cd;
+        var d = 0;
+        for (final loc in locations) {
+          final body = await _captureRaw(
+              7, 'descriptor_${d++}', loc, () => conn.diagnosticGetUrl(loc));
+          cd ??= body == null ? null : _findContentDirectory(body, loc);
+        }
+        if (cd == null) return;
+        final cdir = cd;
+
+        // 3. Browse the root, then one level into each child container.
+        Future<String?> browse(String name, String objectId) => _captureRaw(
+              7,
+              name,
+              'Browse($objectId) @ ${cdir.controlUrl}',
+              () => conn.diagnosticSoapPost(cdir.controlUrl,
+                  '${cdir.serviceType}#Browse',
+                  _browseSoap(cdir.serviceType, objectId)),
+            );
+        final root = await browse('browse_root', '0');
+        if (root == null) return;
+        var i = 0;
+        for (final id in _browseContainers(root).take(8)) {
+          await browse('browse_container_${i++}_$id', id);
+        }
+      });
+
+  /// The `LOCATION` header value from an SSDP response, or null.
+  String? _extractLocation(String ssdpResponse) {
+    for (final line in ssdpResponse.split('\r\n')) {
+      final i = line.indexOf(':');
+      if (i < 0) continue;
+      if (line.substring(0, i).trim().toLowerCase() == 'location') {
+        return line.substring(i + 1).trim();
+      }
+    }
+    return null;
+  }
+
+  /// Find the ContentDirectory service's control URL + serviceType in
+  /// a UPnP device descriptor.
+  ({String controlUrl, String serviceType})? _findContentDirectory(
+      String descriptorXml, String descUrl) {
+    try {
+      final doc = XmlDocument.parse(descriptorXml);
+      final base =
+          doc.findAllElements('URLBase').firstOrNull?.innerText.trim();
+      for (final svc in doc.findAllElements('service')) {
+        final type =
+            svc.findElements('serviceType').firstOrNull?.innerText.trim();
+        if (type == null || !type.contains('ContentDirectory')) continue;
+        final ctrl =
+            svc.findElements('controlURL').firstOrNull?.innerText.trim();
+        if (ctrl == null || ctrl.isEmpty) continue;
+        final resolved =
+            Uri.parse(base != null && base.isNotEmpty ? base : descUrl)
+                .resolve(ctrl)
+                .toString();
+        return (controlUrl: resolved, serviceType: type);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// A SOAP `Browse` envelope for [objectId] (`BrowseDirectChildren`).
+  String _browseSoap(String serviceType, String objectId) =>
+      '<?xml version="1.0" encoding="utf-8"?>'
+      '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+      's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+      '<s:Body>'
+      '<u:Browse xmlns:u="$serviceType">'
+      '<ObjectID>$objectId</ObjectID>'
+      '<BrowseFlag>BrowseDirectChildren</BrowseFlag>'
+      '<Filter>*</Filter>'
+      '<StartingIndex>0</StartingIndex>'
+      '<RequestedCount>50</RequestedCount>'
+      '<SortCriteria></SortCriteria>'
+      '</u:Browse>'
+      '</s:Body>'
+      '</s:Envelope>';
+
+  /// Child container ObjectIDs from a SOAP `Browse` response — the
+  /// `<Result>` element holds escaped DIDL-Lite with `<container>`s.
+  List<String> _browseContainers(String soapResponse) {
+    try {
+      final soap = XmlDocument.parse(soapResponse);
+      final result = soap.findAllElements('Result').firstOrNull?.innerText;
+      if (result == null || result.isEmpty) return const [];
+      final didl = XmlDocument.parse(result);
+      return [
+        for (final c in didl.findAllElements('container'))
+          if (c.getAttribute('id') != null) c.getAttribute('id')!,
+      ];
+    } catch (_) {
+      return const [];
+    }
+  }
+
   Future<void> _runStep(Future<void> Function() body) async {
     if (_running) return;
     _running = true;
@@ -259,21 +397,35 @@ class CameraDiagnostics extends ChangeNotifier {
   Future<void> _capture(
       int step, String name, Map<String, String> query) async {
     final conn = _ref.read(cameraConnectionProvider);
-    final ts = DateTime.now();
     final reqStr = query.entries.map((e) => '${e.key}=${e.value}').join('&');
+    await _captureRaw(step, name, reqStr, () => conn.diagnosticRawGet(query));
+  }
+
+  /// Run [request] and record the result — or the error that replaced
+  /// it — as a snapshot. Returns the body, or null on failure.
+  Future<String?> _captureRaw(int step, String name, String request,
+      Future<String> Function() run) async {
+    final ts = DateTime.now();
     try {
-      final body = await conn.diagnosticRawGet(query);
+      final body = await run();
       _snapshots.add(DiagnosticSnapshot(
-          step: step, name: name, request: reqStr, timestamp: ts, body: body));
+          step: step,
+          name: name,
+          request: request,
+          timestamp: ts,
+          body: body));
+      notifyListeners();
+      return body;
     } catch (e) {
       _snapshots.add(DiagnosticSnapshot(
           step: step,
           name: name,
-          request: reqStr,
+          request: request,
           timestamp: ts,
           error: e.toString()));
+      notifyListeners();
+      return null;
     }
-    notifyListeners();
   }
 
   // --- HTTP server + mDNS.

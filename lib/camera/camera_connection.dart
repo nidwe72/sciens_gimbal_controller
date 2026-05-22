@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/legacy.dart';
 
 import 'jpeg_decoder.dart';
 import 'lumix_camera.dart';
+import 'lumix_content.dart';
 import 'lumix_protocol.dart';
 import 'mjpeg_udp_stream.dart';
 
@@ -52,6 +53,7 @@ class CameraConnection extends ChangeNotifier {
   StreamSubscription<Uint8List>? _previewSub;
   bool _previewActive = false;
   bool _previewPaused = false;
+  int _previewPort = 49199;
   String? _previewError;
   final _previewImage = ValueNotifier<ui.Image?>(null);
 
@@ -67,6 +69,12 @@ class CameraConnection extends ChangeNotifier {
   String? _focalWire;
   String? _exposureWire;
   String? _recMode;
+
+  // Captured-image state (PR 8).
+  LumixContent? _content;
+  String? _lastFullImageUrl;
+  final _capturedImage = ValueNotifier<ui.Image?>(null);
+  bool _fetchInProgress = false;
 
   CameraStatus get status => _status;
   String get statusText => _statusText;
@@ -116,6 +124,16 @@ class CameraConnection extends ChangeNotifier {
   /// Raw camera shooting mode (`shutter_ae`, `aperture_ae`, …), read
   /// from `curmenu` every ~5 s. Null until the first read.
   String? get recMode => _recMode;
+
+  /// Latest captured still (medium JPEG) for the camera pane, set
+  /// after a capture. Null until the first shot is fetched.
+  ValueListenable<ui.Image?> get capturedImage => _capturedImage;
+
+  /// True while a post-capture image fetch (and the camera-mode
+  /// restore that follows) is running. The capture button stays
+  /// disabled until it clears, so a new capture can't land while the
+  /// camera is briefly in playback mode.
+  bool get fetchInProgress => _fetchInProgress;
 
   /// Connect lifecycle (per SPEC Phase 2 "Connect-time and
   /// disconnect-time orderings"):
@@ -212,6 +230,11 @@ class CameraConnection extends ChangeNotifier {
       // 6. Connected.
       _setStatus(CameraStatus.connected, 'Connected to camera at $ip');
       _startPolling();
+      // Warm up ContentDirectory discovery so the first captured
+      // image (PR 8) appears without the ~3 s SSDP delay.
+      final content = LumixContent(camera);
+      _content = content;
+      content.discover();
       return true;
     } on LumixException catch (e) {
       await _failTo(e.message);
@@ -236,6 +259,7 @@ class CameraConnection extends ChangeNotifier {
       return false;
     }
     if (_previewActive) return true;
+    _previewPort = udpPort;
     _previewError = null;
 
     final camera = _camera;
@@ -340,6 +364,34 @@ class CameraConnection extends ChangeNotifier {
     return camera.rawGet(query);
   }
 
+  /// Diagnostics: GET an arbitrary URL on the live camera handle.
+  Future<String> diagnosticGetUrl(String url) {
+    final camera = _camera;
+    if (camera == null) {
+      throw LumixException('not_connected: no active camera');
+    }
+    return camera.rawGetUrl(url);
+  }
+
+  /// Diagnostics: POST a SOAP request on the live camera handle.
+  Future<String> diagnosticSoapPost(
+      String url, String soapAction, String body) {
+    final camera = _camera;
+    if (camera == null) {
+      throw LumixException('not_connected: no active camera');
+    }
+    return camera.soapPost(url, soapAction, body);
+  }
+
+  /// Diagnostics: SSDP M-SEARCH on the camera network; raw replies.
+  Future<List<String>> diagnosticSsdpProbe() {
+    final camera = _camera;
+    if (camera == null) {
+      throw LumixException('not_connected: no active camera');
+    }
+    return camera.ssdpProbe();
+  }
+
   /// Apply a camera setting (`setsetting`). Returns null on success,
   /// or a short error detail (an `err_*` code, or a transport error)
   /// that the camera tab turns into a transient "Camera rejected"
@@ -369,6 +421,90 @@ class CameraConnection extends ChangeNotifier {
       return e.message;
     } catch (e) {
       return '$e';
+    }
+  }
+
+  /// Fetch the most-recent captured JPEG (medium size) and publish it
+  /// via [capturedImage]; also stash the full-res URL for
+  /// [fetchFullImage]. Called after a successful capture. Best-effort
+  /// — a failure simply leaves no still.
+  Future<void> fetchLastImage() async {
+    final content = _content;
+    final camera = _camera;
+    if (content == null || camera == null) return;
+    _fetchInProgress = true;
+    notifyListeners();
+    try {
+      final item = await content.fetchLatest();
+      if (item == null) return;
+      _lastFullImageUrl = item.fullUrl;
+      final mediumUrl = item.mediumUrl ?? item.fullUrl;
+      if (mediumUrl == null) return;
+      final image = await decodeJpeg(await camera.rawGetBytes(mediumUrl));
+      _capturedImage.value?.dispose();
+      _capturedImage.value = image;
+    } catch (_) {
+      // Best effort — no still shown.
+    } finally {
+      await _restoreAfterContentAccess(camera);
+    }
+  }
+
+  /// Fetch the full-resolution version of the last captured image,
+  /// decoded at a capped width, for the full-screen viewer. Null on
+  /// failure or if nothing has been captured.
+  Future<ui.Image?> fetchFullImage() async {
+    final content = _content;
+    final camera = _camera;
+    if (content == null || camera == null) return null;
+    _fetchInProgress = true;
+    notifyListeners();
+    ui.Image? result;
+    try {
+      // Re-browse first: the SOAP Browse flips the camera into
+      // playback mode, which the :50001 image server needs in order
+      // to serve content — the same proven path fetchLastImage uses.
+      // It also refreshes the URL.
+      final item = await content.fetchLatest();
+      final url = item?.fullUrl ?? _lastFullImageUrl;
+      if (url != null) {
+        result = await decodeJpeg(
+          await camera.rawGetBytes(url,
+              timeout: const Duration(seconds: 25)),
+          targetWidth: 3000,
+        );
+      }
+    } catch (_) {
+      result = null;
+    }
+    // Restore in the background so the full-screen viewer isn't held
+    // up by the recmode + preview-restart round trips.
+    unawaited(_restoreAfterContentAccess(camera));
+    return result;
+  }
+
+  /// Recover the camera after touching the DLNA content server.
+  /// Browsing / downloading silently flips the camera into playback
+  /// mode, which drops both the shutter (`camcmd capture` is accepted
+  /// but takes no photo) and the MJPEG stream. Re-assert record mode,
+  /// and bounce live preview if it was running. Clears
+  /// [fetchInProgress] when done. Best-effort throughout.
+  Future<void> _restoreAfterContentAccess(LumixCamera camera) async {
+    try {
+      try {
+        await camera.recMode();
+      } catch (_) {
+        // Best effort — the next poll's getstate keeps us honest.
+      }
+      // recmode does not restart the MJPEG stream; bounce the preview
+      // (stopstream + fresh socket + startstream) so it keeps running.
+      if (_previewActive) {
+        await stopLivePreview();
+        await startLivePreview(udpPort: _previewPort);
+      }
+    } finally {
+      _fetchInProgress = false;
+      notifyListeners();
     }
   }
 
@@ -474,6 +610,10 @@ class CameraConnection extends ChangeNotifier {
     }
     _camera = null;
     _caps = null;
+    _content = null;
+    _lastFullImageUrl = null;
+    _capturedImage.value?.dispose();
+    _capturedImage.value = null;
     _setStatus(CameraStatus.disconnected, 'Disconnected');
   }
 
@@ -490,6 +630,10 @@ class CameraConnection extends ChangeNotifier {
     }
     _camera = null;
     _caps = null;
+    _content = null;
+    _lastFullImageUrl = null;
+    _capturedImage.value?.dispose();
+    _capturedImage.value = null;
     _errorText = message;
     _setStatus(CameraStatus.error, 'Disconnected');
   }
@@ -508,6 +652,8 @@ class CameraConnection extends ChangeNotifier {
     _previewStream?.close();
     _previewImage.value?.dispose();
     _previewImage.dispose();
+    _capturedImage.value?.dispose();
+    _capturedImage.dispose();
     _camera?.disconnect(streaming: _previewActive);
     super.dispose();
   }

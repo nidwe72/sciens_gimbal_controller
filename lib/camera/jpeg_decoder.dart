@@ -16,8 +16,12 @@ import 'dart:ui' as ui;
 ///   - Using `decodeImageFromPixels` from raw RGBA on a worker.
 ///   - Pre-allocating a long-lived isolate.
 /// Neither is needed for the SPEC's ~5 fps cap.
-Future<ui.Image> decodeJpeg(Uint8List jpeg) async {
-  final codec = await ui.instantiateImageCodec(jpeg);
+/// [targetWidth] caps the decode resolution (height scales to keep
+/// aspect) — used for the full-res captured image so a 6000×4000 JPEG
+/// doesn't decode to a ~96 MB texture. Null decodes at native size.
+Future<ui.Image> decodeJpeg(Uint8List jpeg, {int? targetWidth}) async {
+  final codec =
+      await ui.instantiateImageCodec(jpeg, targetWidth: targetWidth);
   try {
     final frame = await codec.getNextFrame();
     return frame.image;

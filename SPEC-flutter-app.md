@@ -1948,13 +1948,14 @@ Playground
             5. Mode rejection      (dial to A / S, guided)
             6. Shutter sweep       (set+read every shutter entry)
             7. Aperture sweep      (set+read every aperture entry)
-            8. Review & export     (results + HTTP server)
+            8. ContentDirectory probe  (UPnP image-server probe)
+            9. Review & export     (results + HTTP server)
 ```
 
 **The wizard.** A linear `Stepper` with `currentStep` driven
 manually; "Continue" is gated on the step's capture having run, and
 steps tolerate failure (a diagnostic tool keeps partial results).
-Steps 1–7 require `connected` + rec mode; step 8 works while
+Steps 1–8 require `connected` + rec mode; step 9 works while
 disconnected. Each step shows its instruction, a Run button, and the
 raw result inline.
 
@@ -2373,9 +2374,109 @@ Shipped and verified on the S5D.
 Verified on hardware: the readout chip follows the mode dial, and
 shutter / aperture editability changes with it.
 
+#### PR 8 — Captured-image review
+
+After a capture the app fetches the resulting JPEG and shows it.
+
+**UX (decided).**
+- The captured still occupies the **live-preview pane**.
+- Live preview **on** at capture time → the still shows for **~5 s**,
+  then the live feed resumes.
+- Live preview **off** → the still **stays** until the next capture.
+- **Double-tap** the still → a full-screen dialog with gallery-style
+  pinch-zoom + pan (`InteractiveViewer`); a close affordance leaves
+  it.
+- The pane uses a **medium-size** JPEG; the full-screen view fetches
+  the **full-resolution** JPEG.
+- Scope is the **last shot only** — not an SD-card browser.
+- **JPEG is the user's responsibility** — the app does not touch the
+  camera's quality setting; a RAW-only camera has no JPEG to show.
+
+**Retrieval — UPnP/DLNA ContentDirectory (probed).** `camcmd
+capture` only trips the shutter; the image lands on the card and is
+fetched over the camera's UPnP MediaServer. The Step-1 probe
+established the flow:
+
+1. **SSDP M-SEARCH** → the device descriptor at
+   `http://<ip>:60606/Lumix/Server0/ddd`. The MediaServer *is*
+   advertised in rec/remote mode — **no `playmode` switch needed.**
+2. The descriptor names the **ContentDirectory** service; its
+   control URL is `http://<ip>:60606/Server0/CDS_control`.
+3. **SOAP `Browse(ObjectID="0", BrowseDirectChildren)`** returns the
+   image `<item>`s directly — no container nesting. The response
+   carries `TotalMatches`; the list paginates via `StartingIndex` /
+   `RequestedCount`, in capture order.
+4. Each `<item>` carries three JPEG `<res>` resources, all served by
+   a second HTTP server on **`:50001`**:
+   - `JPEG_LRG` — `…:50001/DO<id>.JPG`, the full original (~9 MB) —
+     used by the **full-screen** view;
+   - `JPEG_SM` — `…:50001/DS<id>.JPG` (~100 KB) — used **inline**;
+   - `JPEG_TN` — `…:50001/DT<id>.JPG` (~5 KB) — unused.
+5. The **last shot** is the highest-indexed item — `Browse` near
+   `StartingIndex = TotalMatches − 1`, picking the item with the
+   highest `id` (the in-app code confirms the order rather than
+   trusting it).
+
+New transport: SOAP POST plus the plain `:50001` image GETs,
+alongside the `cam.cgi` GETs. The control URL is SSDP-discovered
+once per session and cached.
+
+**As built.** `lib/camera/lumix_content.dart` holds the
+ContentDirectory client: `extractSsdpLocation`, `findContentDirectory`
+(descriptor → control URL, resolving `URLBase`/relative paths),
+`browseSoapEnvelope` / `parseBrowseResult` (escaped DIDL-Lite →
+`JPEG_SM`/`JPEG_LRG` URLs), and `LumixContent` (`discover()` caches
+the SSDP-found service; `fetchLatest()` browses the list tail and
+picks the highest `id`). `LumixCamera.rawGetBytes` GETs image bytes
+through the FIFO queue without UTF-8 decoding; `decodeJpeg` gained a
+`targetWidth` cap (full-screen decodes at ≤3000 px). `connect()`
+warms discovery in the background. The pane (`_CameraPane`) shows the
+still or the live feed, with the 5-s revert; double-tap opens
+`_FullScreenImage` — an edge-to-edge `InteractiveViewer` with no app
+bar (image centered on the whole screen, in either orientation), a
+floating close button, and the system bars hidden (`immersiveSticky`,
+restored on close). The capture button drives the fetch on its
+success path. Tested in `test/lumix_content_test.dart`.
+
+**Content-access recovery (on-hardware fixes).** Reading the DLNA
+content server — the SOAP `Browse` and/or the `:50001` image
+download — silently flips the camera into playback mode. `getstate`
+still answers (so the connection looks alive), but two things break:
+
+- `camcmd capture` is accepted without taking a photo — the *first*
+  capture works, the *second* times out with "Capture may not have
+  completed";
+- the MJPEG live stream stops (playback mode has no live view), so
+  the preview freezes on its last frame a few seconds after a shot.
+
+`_restoreAfterContentAccess` (run in a `finally` after every fetch)
+handles both: it re-asserts `recmode`, then — if live preview was
+running — bounces it (`stopstream` + fresh socket + `startstream`)
+since `recmode` does not restart the stream. For `fetchFullImage`
+the restore runs unawaited so the full-screen viewer isn't delayed.
+A `fetchInProgress` flag keeps the capture button disabled across the
+whole fetch+restore, so a new capture can't land in the brief
+playback window. (Discovery — SSDP + the descriptor GET — is a
+harmless read and does *not* flip the camera, which is why the first
+capture is unaffected.)
+
+The mirror of this: the `:50001` image server only serves while the
+camera is in **playback** mode. `fetchLastImage` gets there for free
+(its `Browse` flips the camera before the download); `fetchFullImage`
+has no Browse of its own, so — once `recmode` leaves the camera in
+record mode — it must re-run `fetchLatest()` (a Browse) first to flip
+back to playback before pulling the full-res JPEG. That download also
+uses a longer `rawGetBytes` timeout (~25 s) — the default 5 s is too
+tight for a ~9 MB file.
+
+Verified on hardware (S5D): a still appears in the pane after every
+capture; repeated capture, live-preview and full-screen cycles all
+hold up; the full-screen viewer is centered and fills the screen in
+both orientations.
+
 #### Sign-off
 
-After PR 6 and PR 7 land and all on-hardware verification
+After PR 6, PR 7 and PR 8 land and all on-hardware verification
 checkpoints above pass, Phase 2 is complete. Move to Phase 3 (protocol library
 extraction) or Phase 4 (panorama sequencer) — order optional.
 
@@ -2390,8 +2491,9 @@ extraction) or Phase 4 (panorama sequencer) — order optional.
 - Manual exposure mode switching (P/A/S/M selection — the dial on
   the camera body handles this).
 - Video recording (`video_recstart` / `video_recstop`).
-- Image transfer / browsing the SD card (the SOAP /
-  ContentDirectory binding documented in `libgphoto2` is unused).
+- Browsing the SD card / a photo library. PR 8 fetches only the
+  *last* captured image over the ContentDirectory; a full card
+  browser stays out of scope.
 - Long-press capture / bulb timing UI. Capture is a single press;
   the camera handles its own bulb duration.
 - Multi-camera support.

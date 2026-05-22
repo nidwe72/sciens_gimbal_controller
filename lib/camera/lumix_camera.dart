@@ -267,6 +267,108 @@ class LumixCamera {
   Future<String> rawGet(Map<String, String> query) =>
       _request(urlRaw(_requireIp(), query));
 
+  /// GET an arbitrary absolute URL (not necessarily `cam.cgi`) through
+  /// the FIFO queue — used to probe the UPnP ContentDirectory.
+  Future<String> rawGetUrl(String url) => _request(url);
+
+  /// GET an arbitrary URL and return the raw bytes (no UTF-8 decode)
+  /// through the FIFO queue — used to fetch captured JPEGs. [timeout]
+  /// overrides [httpTimeout] (the full-res JPEG needs more headroom).
+  Future<Uint8List> rawGetBytes(String url, {Duration? timeout}) {
+    return _queue.enqueue(() async {
+      try {
+        final r = await _httpClient
+            .get(Uri.parse(url))
+            .timeout(timeout ?? httpTimeout);
+        if (r.statusCode != 200) {
+          throw LumixException(
+              'http_${r.statusCode}: ${r.reasonPhrase ?? "unknown"}');
+        }
+        return r.bodyBytes;
+      } on LumixException {
+        rethrow;
+      } on TimeoutException {
+        throw LumixException('http_timeout');
+      } on SocketException catch (e) {
+        throw LumixException('http_socket: ${e.message}');
+      } catch (e) {
+        throw LumixException('http_error: $e');
+      }
+    });
+  }
+
+  /// POST a SOAP request through the FIFO queue. [soapAction] is the
+  /// bare action; it is quoted into the `SOAPAction` header.
+  Future<String> soapPost(String url, String soapAction, String body) {
+    return _queue.enqueue(() async {
+      try {
+        final r = await _httpClient
+            .post(
+              Uri.parse(url),
+              headers: {
+                'Content-Type': 'text/xml; charset="utf-8"',
+                'SOAPAction': '"$soapAction"',
+              },
+              body: body,
+            )
+            .timeout(httpTimeout);
+        if (r.statusCode != 200) {
+          throw LumixException(
+              'http_${r.statusCode}: ${r.reasonPhrase ?? "unknown"}');
+        }
+        return _decodeBody(r);
+      } on LumixException {
+        rethrow;
+      } on TimeoutException {
+        throw LumixException('http_timeout');
+      } on SocketException catch (e) {
+        throw LumixException('http_socket: ${e.message}');
+      } catch (e) {
+        throw LumixException('http_error: $e');
+      }
+    });
+  }
+
+  /// Send an SSDP M-SEARCH and collect every reply within [window].
+  /// Returns the raw response datagrams — the diagnostics probe uses
+  /// them to discover UPnP descriptor (`LOCATION`) URLs. Best-effort:
+  /// returns whatever arrived.
+  Future<List<String>> ssdpProbe({
+    Duration window = const Duration(seconds: 3),
+  }) async {
+    final responses = <String>[];
+    RawDatagramSocket? socket;
+    try {
+      socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      socket.readEventsEnabled = true;
+      socket.broadcastEnabled = true;
+      final search = utf8.encode(
+        'M-SEARCH * HTTP/1.1\r\n'
+        'HOST: $_ssdpAddress:$_ssdpPort\r\n'
+        'MAN: "ssdp:discover"\r\n'
+        'MX: 2\r\n'
+        'ST: ssdp:all\r\n'
+        '\r\n',
+      );
+      socket.send(search, InternetAddress(_ssdpAddress), _ssdpPort);
+      final s = socket;
+      final sub = s.listen((event) {
+        if (event != RawSocketEvent.read) return;
+        final dg = s.receive();
+        if (dg != null) {
+          responses.add(utf8.decode(dg.data, allowMalformed: true));
+        }
+      });
+      await Future<void>.delayed(window);
+      await sub.cancel();
+    } catch (_) {
+      // Best effort — return whatever was collected.
+    } finally {
+      socket?.close();
+    }
+    return responses;
+  }
+
   String _requireIp() {
     final ip = _cameraIp;
     if (ip == null) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../camera/camera_connection.dart';
@@ -428,10 +429,7 @@ class _ConnectedViewState extends State<_ConnectedView> {
             ),
           ),
         ],
-        if (_previewToggle) ...[
-          const SizedBox(height: 8),
-          _PreviewPane(conn: conn),
-        ],
+        _CameraPane(conn: conn),
         const Divider(height: 24),
         _ModeReadout(mode: mode),
         const SizedBox(height: 12),
@@ -830,7 +828,10 @@ class _CaptureButtonState extends State<_CaptureButton> {
       _capturing = false;
       _message = message;
     });
-    if (message != null) {
+    if (message == null) {
+      // Capture succeeded — pull the JPEG into the pane (PR 8).
+      widget.conn.fetchLastImage();
+    } else {
       _messageTimer?.cancel();
       _messageTimer = Timer(const Duration(seconds: 4), () {
         if (mounted) setState(() => _message = null);
@@ -845,8 +846,9 @@ class _CaptureButtonState extends State<_CaptureButton> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         FilledButton(
-          onPressed: _capturing ? null : _onTap,
-          child: _capturing
+          onPressed:
+              (_capturing || widget.conn.fetchInProgress) ? null : _onTap,
+          child: (_capturing || widget.conn.fetchInProgress)
               ? const SizedBox(
                   width: 18,
                   height: 18,
@@ -868,42 +870,204 @@ class _CaptureButtonState extends State<_CaptureButton> {
   }
 }
 
-class _PreviewPane extends StatelessWidget {
-  const _PreviewPane({required this.conn});
+/// The camera pane — shows the live MJPEG preview, or the most-recent
+/// captured still. Per PR 8: a fresh capture is shown for ~5 s while
+/// live preview runs, or until the next capture when it doesn't.
+/// Renders nothing when there's neither a live stream nor a still.
+class _CameraPane extends StatefulWidget {
+  const _CameraPane({required this.conn});
+
   final CameraConnection conn;
+
+  @override
+  State<_CameraPane> createState() => _CameraPaneState();
+}
+
+class _CameraPaneState extends State<_CameraPane> {
+  bool _showCapture = false;
+  Timer? _revertTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.conn.addListener(_onConnChanged);
+    widget.conn.capturedImage.addListener(_onCaptured);
+  }
+
+  @override
+  void dispose() {
+    widget.conn.removeListener(_onConnChanged);
+    widget.conn.capturedImage.removeListener(_onCaptured);
+    _revertTimer?.cancel();
+    super.dispose();
+  }
+
+  void _onCaptured() {
+    if (widget.conn.capturedImage.value == null) return;
+    _revertTimer?.cancel();
+    _revertTimer = null;
+    setState(() => _showCapture = true);
+    if (widget.conn.previewActive) _scheduleRevert();
+  }
+
+  void _onConnChanged() {
+    if (!_showCapture) return;
+    if (widget.conn.previewActive) {
+      if (_revertTimer == null) _scheduleRevert();
+    } else {
+      // Live preview stopped — the still now stays.
+      _revertTimer?.cancel();
+      _revertTimer = null;
+    }
+  }
+
+  void _scheduleRevert() {
+    _revertTimer = Timer(const Duration(seconds: 5), () {
+      _revertTimer = null;
+      if (mounted) setState(() => _showCapture = false);
+    });
+  }
+
+  void _openFullScreen() {
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      fullscreenDialog: true,
+      builder: (_) => _FullScreenImage(conn: widget.conn),
+    ));
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return AspectRatio(
-      aspectRatio: 4 / 3,
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.black,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: theme.colorScheme.outlineVariant,
-          ),
-        ),
-        clipBehavior: Clip.antiAlias,
-        alignment: Alignment.center,
-        child: ValueListenableBuilder<ui.Image?>(
-          valueListenable: conn.previewImage,
-          builder: (context, image, _) {
-            if (image == null) {
-              return Text(
+    final conn = widget.conn;
+    final captured = conn.capturedImage.value;
+    final showingStill = _showCapture && captured != null;
+
+    if (!showingStill && !conn.previewActive) {
+      return const SizedBox.shrink();
+    }
+
+    final Widget content;
+    if (showingStill) {
+      content = GestureDetector(
+        onDoubleTap: _openFullScreen,
+        child: RawImage(image: captured, fit: BoxFit.contain),
+      );
+    } else {
+      content = ValueListenableBuilder<ui.Image?>(
+        valueListenable: conn.previewImage,
+        builder: (context, image, _) => image == null
+            ? Text(
                 'Waiting for frames...',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: Colors.white70,
-                ),
-              );
-            }
-            return RawImage(
-              image: image,
-              fit: BoxFit.contain,
-            );
-          },
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: Colors.white70),
+              )
+            : RawImage(image: image, fit: BoxFit.contain),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: AspectRatio(
+        aspectRatio: 4 / 3,
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.black,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: theme.colorScheme.outlineVariant),
+          ),
+          clipBehavior: Clip.antiAlias,
+          alignment: Alignment.center,
+          child: content,
         ),
+      ),
+    );
+  }
+}
+
+/// Full-screen viewer for the captured image — fetches the full-res
+/// JPEG and shows it edge-to-edge in a pinch-zoomable
+/// `InteractiveViewer`. Hides the system bars while open so the image
+/// uses the whole screen, in either orientation.
+class _FullScreenImage extends StatefulWidget {
+  const _FullScreenImage({required this.conn});
+
+  final CameraConnection conn;
+
+  @override
+  State<_FullScreenImage> createState() => _FullScreenImageState();
+}
+
+class _FullScreenImageState extends State<_FullScreenImage> {
+  ui.Image? _image;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _load();
+  }
+
+  Future<void> _load() async {
+    final image = await widget.conn.fetchFullImage();
+    if (!mounted) {
+      image?.dispose();
+      return;
+    }
+    setState(() {
+      _image = image;
+      _failed = image == null;
+    });
+  }
+
+  @override
+  void dispose() {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    _image?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final image = _image;
+    final Widget content;
+    if (image != null) {
+      content = InteractiveViewer(
+        maxScale: 6,
+        child: RawImage(image: image, fit: BoxFit.contain),
+      );
+    } else if (_failed) {
+      content = const Center(
+        child: Text('Could not load the image.',
+            style: TextStyle(color: Colors.white70)),
+      );
+    } else {
+      content = const Center(child: CircularProgressIndicator());
+    }
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          Positioned.fill(child: content),
+          Positioned(
+            top: 0,
+            left: 0,
+            child: SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(8),
+                child: Material(
+                  color: Colors.black54,
+                  shape: const CircleBorder(),
+                  clipBehavior: Clip.antiAlias,
+                  child: IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
