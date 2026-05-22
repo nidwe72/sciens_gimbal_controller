@@ -55,6 +55,17 @@ String urlStartStream(String ip, int udpPort) =>
 
 String urlStopStream(String ip) => '${_base(ip)}?mode=stopstream';
 
+/// Build an arbitrary `cam.cgi` URL from a query-parameter map. Used
+/// by the diagnostics tool to probe endpoints the typed builders
+/// above don't cover (`getinfo?type=curmenu`, lens info, …).
+String urlRaw(String ip, Map<String, String> query) {
+  final qs = query.entries
+      .map((e) =>
+          '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}')
+      .join('&');
+  return '${_base(ip)}?$qs';
+}
+
 // ---------------------------------------------------------------------------
 // Shutter-speed encoding.
 //
@@ -82,13 +93,17 @@ const String shutterBulbWire = '256/256';
 double? shutterWireToSeconds(String wire) {
   final m = RegExp(r'^(-?\d+)/256$').firstMatch(wire.trim());
   if (m == null) return null;
-  final num = int.parse(m.group(1)!);
-  if (num == 256) return double.infinity; // Bulb
-  // pow(2, -num/256)
-  // We avoid 'dart:math' here so this file stays trivially testable.
-  // 2^x via exp(x * ln2). Inlining the constants.
+  var numerator = int.parse(m.group(1)!);
+  // The camera reports negative numerators as an unsigned int16 — a
+  // 2 s exposure set as `-256/256` reads back as `65280/256`
+  // (= -256 mod 65536). Fold the upper half of the uint16 range back
+  // to negative so the signed form we send and the unsigned form the
+  // body returns decode identically. See SPEC Pre-PR 5 — as built.
+  if (numerator > 32767) numerator -= 65536;
+  if (numerator == 256) return double.infinity; // Bulb
+  // pow(2, -numerator/256): 2^x via exp(x * ln2) — avoids 'dart:math'.
   const ln2 = 0.6931471805599453;
-  final x = -num / 256.0;
+  final x = -numerator / 256.0;
   return _exp(x * ln2);
 }
 
@@ -302,16 +317,17 @@ String? parseGetSetting(String body, String type) {
 }
 
 /// Sentinel `getsetting?type=focal` returns when no aperture data is
-/// available (lens not present, body in playback mode, etc.). `32767`
-/// is `0x7FFF` — the max signed int16, a classic "no value" marker.
-const String _apertureUnavailableWire = '32767/256';
+/// available (a manual-aperture lens, no lens, body in playback mode,
+/// etc.). `32767` is `0x7FFF` — the max signed int16, a classic
+/// "no value" marker.
+const String apertureSentinelWire = '32767/256';
 
 /// Decode a `<settingvalue focal="...">` attribute into an f-number.
 /// Returns null when the camera reports the no-data sentinel.
 double? apertureFromGetSetting(String body) {
   final wire = parseGetSetting(body, 'focal');
   if (wire == null) return null;
-  if (wire == _apertureUnavailableWire) return null;
+  if (wire == apertureSentinelWire) return null;
   return apertureWireToFNumber(wire);
 }
 
@@ -327,6 +343,8 @@ class CameraState {
     required this.battery,
     required this.firmwareVersion,
     required this.sdCardStatus,
+    required this.sdAccess,
+    required this.remainCapacity,
   });
 
   /// Camera mode: usually `"rec"` (after `recmode`) or `"play"`.
@@ -340,6 +358,15 @@ class CameraState {
 
   /// SD card status, e.g. `"write_enable"`, `"set"`, `"unset"`.
   final String sdCardStatus;
+
+  /// True while the body is writing to the card (`<sd_access>on`) —
+  /// the rec-mode "busy" signal (Pre-PR 5 finding).
+  final bool sdAccess;
+
+  /// Remaining stills the card can hold (`<remaincapacity>`), or null
+  /// if absent. Decrements by one per saved shot — the Capture
+  /// button's completion signal.
+  final int? remainCapacity;
 
   bool get isRecMode => cammode == 'rec';
   bool get isPlayMode => cammode == 'play';
@@ -373,6 +400,8 @@ CameraState? parseGetState(String body) {
       battery: inner('batt'),
       firmwareVersion: inner('version'),
       sdCardStatus: inner('sdcardstatus'),
+      sdAccess: inner('sd_access') == 'on',
+      remainCapacity: int.tryParse(inner('remaincapacity')),
     );
   } catch (_) {
     return null;
@@ -504,3 +533,88 @@ const List<String> defaultShutterValues = <String>[
   // Bulb last.
   '256/256',
 ];
+
+/// Standard 1/3-stop aperture wire values for setsetting `focal`.
+/// Wire `<numerator>/256`, displayed f-number ≈ `pow(2, numerator/512)`;
+/// a 1/3 stop steps the numerator by 256/3. The mounted lens caps the
+/// usable range — the camera `err_*`s any stop the lens can't reach,
+/// which the camera tab surfaces.
+///
+/// Order: widest (f/1.4) → narrowest (f/22).
+const List<String> defaultApertureValues = <String>[
+  '256/256',  // f/1.4
+  '341/256',  // f/1.6
+  '427/256',  // f/1.8
+  '512/256',  // f/2.0
+  '597/256',  // f/2.2
+  '683/256',  // f/2.5
+  '768/256',  // f/2.8
+  '853/256',  // f/3.2
+  '939/256',  // f/3.5
+  '1024/256', // f/4.0
+  '1109/256', // f/4.5
+  '1195/256', // f/5.0
+  '1280/256', // f/5.6
+  '1365/256', // f/6.3
+  '1451/256', // f/7.1
+  '1536/256', // f/8
+  '1621/256', // f/9
+  '1707/256', // f/10
+  '1792/256', // f/11
+  '1877/256', // f/13
+  '1963/256', // f/14
+  '2048/256', // f/16
+  '2133/256', // f/18
+  '2219/256', // f/20
+  '2304/256', // f/22
+];
+
+/// The `defaultShutterValues` entry closest to a polled shutter wire,
+/// compared by decoded duration — so the uint16 long-exposure form
+/// and any body-set 1/3-stop value both resolve to the nearest
+/// dropdown entry. Returns null if [polled] is null or undecodable.
+String? nearestShutterWire(String? polled) {
+  if (polled == null) return null;
+  final target = shutterWireToSeconds(polled);
+  if (target == null) return null;
+  String? best;
+  var bestDist = double.infinity;
+  for (final wire in defaultShutterValues) {
+    final s = shutterWireToSeconds(wire);
+    if (s == null) continue;
+    final double dist;
+    if (s == target) {
+      dist = 0;
+    } else if (s.isInfinite || target.isInfinite) {
+      dist = double.infinity;
+    } else {
+      dist = (s / target - 1).abs() + (target / s - 1).abs();
+    }
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = wire;
+    }
+  }
+  return best;
+}
+
+/// The `defaultApertureValues` entry closest to a polled `focal` wire,
+/// compared by f-number. Returns null if [polled] is null, the
+/// no-aperture sentinel, or undecodable.
+String? nearestApertureWire(String? polled) {
+  if (polled == null || polled == apertureSentinelWire) return null;
+  final target = apertureWireToFNumber(polled);
+  if (target == null) return null;
+  String? best;
+  var bestDist = double.infinity;
+  for (final wire in defaultApertureValues) {
+    final f = apertureWireToFNumber(wire);
+    if (f == null) continue;
+    final dist = (f - target).abs();
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = wire;
+    }
+  }
+  return best;
+}

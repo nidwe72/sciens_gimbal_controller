@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../camera/camera_connection.dart';
+import '../camera/camera_diagnostics.dart';
 import '../state/gimbal_connection.dart';
 import 'connect_screen.dart';
 import 'header.dart';
@@ -76,7 +77,9 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
       canPop: false,
       onPopInvokedWithResult: (didPop, _) async {
         if (didPop) return;
-        // Disconnect both transports cleanly.
+        // Disconnect both transports cleanly, and stop the diagnostics
+        // HTTP server so no socket is orphaned.
+        await ref.read(cameraDiagnosticsProvider).stopServer();
         final cam = ref.read(cameraConnectionProvider);
         await cam.disconnect();
         await conn.disconnect();

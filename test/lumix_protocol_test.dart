@@ -47,6 +47,20 @@ void main() {
           'http://$ip/cam.cgi?mode=startstream&value=49199');
       expect(urlStopStream(ip), 'http://$ip/cam.cgi?mode=stopstream');
     });
+
+    test('urlRaw joins a query map and percent-encodes values', () {
+      expect(urlRaw(ip, {'mode': 'getstate'}),
+          'http://$ip/cam.cgi?mode=getstate');
+      final raw = urlRaw(ip, {
+        'mode': 'setsetting',
+        'type': 'focal',
+        'value': '1024/256',
+      });
+      expect(raw, startsWith('http://$ip/cam.cgi?'));
+      expect(raw, contains('mode=setsetting'));
+      expect(raw, contains('type=focal'));
+      expect(raw, contains('value=1024%2F256'));
+    });
   });
 
   group('lumix_protocol — shutter encoding', () {
@@ -86,10 +100,40 @@ void main() {
       expect(s > 1.0, true);
     });
 
+    test('uint16 negative-numerator form decodes like the signed form', () {
+      // The camera reports negative numerators as an unsigned int16:
+      // 2 s set as -256/256 reads back as 65280/256. Both must decode
+      // identically. See SPEC Pre-PR 5 — as built.
+      for (final pair in const [
+        ['-256/256', '65280/256'], // 2 s
+        ['-512/256', '65024/256'], // 4 s
+        ['-1280/256', '64256/256'], // 32 s
+      ]) {
+        final signed = shutterWireToSeconds(pair[0])!;
+        final unsigned = shutterWireToSeconds(pair[1])!;
+        expect((signed - unsigned).abs() < 1e-6, true,
+            reason: '${pair[0]} vs ${pair[1]}');
+        expect(signed > 1.0, true);
+      }
+      expect((shutterWireToSeconds('65280/256')! - 2.0).abs() < 1e-6, true);
+    });
+
     test('garbage input returns null', () {
       expect(shutterWireToSeconds('not a shutter value'), null);
       expect(shutterWireToSeconds('3328'), null);
       expect(shutterWireToSeconds('3328/100'), null);
+    });
+
+    test('nearestShutterWire snaps polled values to a list entry', () {
+      // Exact list entry → itself.
+      expect(nearestShutterWire('1792/256'), '1792/256');
+      // uint16 long-exposure form (2 s) snaps to the -256/256 entry.
+      expect(nearestShutterWire('65280/256'), '-256/256');
+      // A body-set value between two stops snaps to one of them.
+      expect(['1536/256', '1792/256'].contains(nearestShutterWire('1700/256')),
+          true);
+      expect(nearestShutterWire(null), null);
+      expect(nearestShutterWire('xyz'), null);
     });
 
     test('shutterSecondsToLabel rounds fractional denominators', () {
@@ -395,6 +439,29 @@ void main() {
           expect(s < 60, true);
         }
       }
+    });
+  });
+
+  group('lumix_protocol — defaultApertureValues sanity', () {
+    test('all entries decode to ascending f-numbers across ~1.4–22', () {
+      double? prev;
+      for (final wire in defaultApertureValues) {
+        final f = apertureWireToFNumber(wire);
+        expect(f, isNotNull, reason: 'wire $wire failed to decode');
+        expect(f! > 1.0 && f < 32.0, true, reason: 'wire $wire → f/$f');
+        if (prev != null) {
+          expect(f > prev, true, reason: 'not ascending at $wire');
+        }
+        prev = f;
+      }
+    });
+
+    test('nearestApertureWire snaps polled values, rejects the sentinel', () {
+      expect(nearestApertureWire('1024/256'), '1024/256'); // f/4 exact
+      // The 50 mm's clamped max (428/256) snaps to the f/1.8 entry.
+      expect(nearestApertureWire('428/256'), '427/256');
+      expect(nearestApertureWire(apertureSentinelWire), null);
+      expect(nearestApertureWire(null), null);
     });
   });
 }

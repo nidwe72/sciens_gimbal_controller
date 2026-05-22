@@ -14,10 +14,9 @@ import 'mjpeg_udp_stream.dart';
 /// exposed via Riverpod, with a small state enum and human-readable
 /// status text the UI shows.
 ///
-/// PR 3 scope: lifecycle only — Disconnected → Discovering → Registering
-/// → LoadingCaps → Connected, plus the polite-goodbye disconnect
-/// sequence. The polling loop, setting writes, and capture all land
-/// in PR 4.
+/// Owns the connect lifecycle, the live-preview pipeline, and (PR 5)
+/// the always-on 1 Hz polling loop that feeds the controls and keeps
+/// the Lumix session alive.
 enum CameraStatus {
   disconnected,
   discovering,
@@ -28,7 +27,19 @@ enum CameraStatus {
 }
 
 class CameraConnection extends ChangeNotifier {
-  CameraConnection();
+  CameraConnection({
+    LumixCamera Function()? cameraFactory,
+    Duration pollInterval = const Duration(seconds: 1),
+  })  : _cameraFactory = cameraFactory ?? LumixCamera.new,
+        _pollInterval = pollInterval;
+
+  /// Builds the transport for each connect attempt. Injectable so
+  /// `camera_connection_test.dart` can supply a `LumixCamera` wired to
+  /// a mock `http.Client`.
+  final LumixCamera Function() _cameraFactory;
+
+  /// Gap between poll cycles — overridable so tests run fast.
+  final Duration _pollInterval;
 
   LumixCamera? _camera;
   CameraStatus _status = CameraStatus.disconnected;
@@ -39,11 +50,20 @@ class CameraConnection extends ChangeNotifier {
   // Live-preview state (PR 4).
   MjpegUdpStream? _previewStream;
   StreamSubscription<Uint8List>? _previewSub;
-  Timer? _previewKeepAlive;
   bool _previewActive = false;
   bool _previewPaused = false;
   String? _previewError;
   final _previewImage = ValueNotifier<ui.Image?>(null);
+
+  // Polling state (PR 5). A self-rescheduling 1 Hz loop runs while
+  // connected; it carries the session keep-alive (replacing PR 4's
+  // preview-only heartbeat) and feeds the controls.
+  bool _polling = false;
+  int _pollFailCount = 0;
+  CameraState? _cameraState;
+  String? _shutterWire;
+  String? _isoWire;
+  String? _focalWire;
 
   CameraStatus get status => _status;
   String get statusText => _statusText;
@@ -76,6 +96,19 @@ class CameraConnection extends ChangeNotifier {
   /// connection-summary line.
   String? get cameraIp => _camera?.cameraIp;
 
+  /// Latest parsed `getstate` from the 1 Hz poll, or null before the
+  /// first cycle completes.
+  CameraState? get cameraState => _cameraState;
+
+  /// True while the camera is writing to the card (`<sd_access>on`).
+  bool get isBusy => _cameraState?.sdAccess ?? false;
+
+  /// Latest polled wire values for shutter / ISO / aperture, null
+  /// until the first poll reads them.
+  String? get shutterWire => _shutterWire;
+  String? get isoWire => _isoWire;
+  String? get focalWire => _focalWire;
+
   /// Connect lifecycle (per SPEC Phase 2 "Connect-time and
   /// disconnect-time orderings"):
   ///   1. bind()                  — WiFi + multicast lock
@@ -94,7 +127,7 @@ class CameraConnection extends ChangeNotifier {
       return false;
     }
     _errorText = null;
-    final camera = LumixCamera();
+    final camera = _cameraFactory();
     _camera = camera;
 
     try {
@@ -170,6 +203,7 @@ class CameraConnection extends ChangeNotifier {
 
       // 6. Connected.
       _setStatus(CameraStatus.connected, 'Connected to camera at $ip');
+      _startPolling();
       return true;
     } on LumixException catch (e) {
       await _failTo(e.message);
@@ -243,24 +277,8 @@ class CameraConnection extends ChangeNotifier {
       },
     );
 
-    // Keep-alive heartbeat. Lumix bodies time out the session if no
-    // cam.cgi command is sent for ~10 s, which manifests as the
-    // preview pane freezing on its last frame. liblumix's protocol
-    // notes call this out explicitly. We ping `getstate` at 1 Hz —
-    // cheap, idempotent, and read-only. PR 5's full polling loop
-    // will replace this with the same cadence carrying more reads.
-    _previewKeepAlive = Timer.periodic(const Duration(seconds: 1),
-        (_) async {
-      final cam = _camera;
-      if (cam == null || !_previewActive) return;
-      try {
-        await cam.getState();
-      } catch (_) {
-        // Best effort; missed pings will manifest as a freeze, which
-        // is already the failure mode this guards against.
-      }
-    });
-
+    // Session keep-alive is carried by the always-on polling loop
+    // (PR 5) — no preview-specific heartbeat needed.
     _previewActive = true;
     notifyListeners();
     return true;
@@ -272,8 +290,6 @@ class CameraConnection extends ChangeNotifier {
   Future<void> stopLivePreview() async {
     final wasActive = _previewActive;
     _previewActive = false;
-    _previewKeepAlive?.cancel();
-    _previewKeepAlive = null;
     await _previewSub?.cancel();
     _previewSub = null;
     await _previewStream?.close();
@@ -304,9 +320,125 @@ class CameraConnection extends ChangeNotifier {
     _previewPaused = paused;
   }
 
+  /// Issue an arbitrary `cam.cgi` request on the live camera handle.
+  /// Used by the diagnostics tool ([CameraDiagnostics]) so it can
+  /// probe any endpoint without widening the typed transport API.
+  /// Throws a [LumixException] if there is no active connection.
+  Future<String> diagnosticRawGet(Map<String, String> query) {
+    final camera = _camera;
+    if (camera == null) {
+      throw LumixException('not_connected: no active camera');
+    }
+    return camera.rawGet(query);
+  }
+
+  /// Apply a camera setting (`setsetting`). Returns null on success,
+  /// or a short error detail (an `err_*` code, or a transport error)
+  /// that the camera tab turns into a transient "Camera rejected"
+  /// message.
+  Future<String?> applySetting(String type, String value) async {
+    final camera = _camera;
+    if (camera == null) return 'not connected';
+    try {
+      final body = await camera.setSetting(type, value);
+      return isResultOk(body) ? null : resultText(body);
+    } on LumixException catch (e) {
+      return e.message;
+    } catch (e) {
+      return '$e';
+    }
+  }
+
+  /// Fire a single still capture (`camcmd&value=capture`). Returns
+  /// null on success, or a short error detail.
+  Future<String?> capture() async {
+    final camera = _camera;
+    if (camera == null) return 'not connected';
+    try {
+      final body = await camera.capture();
+      return isResultOk(body) ? null : resultText(body);
+    } on LumixException catch (e) {
+      return e.message;
+    } catch (e) {
+      return '$e';
+    }
+  }
+
+  // --- Polling loop (PR 5).
+
+  /// Start the 1 Hz poll. Idempotent; called on reaching Connected.
+  void _startPolling() {
+    if (_polling) return;
+    _polling = true;
+    _pollFailCount = 0;
+    _pollLoop();
+  }
+
+  void _stopPolling() {
+    _polling = false;
+  }
+
+  /// Self-rescheduling poll — await-then-delay rather than
+  /// `Timer.periodic`, so a slow cycle can't pile requests up.
+  Future<void> _pollLoop() async {
+    while (_polling) {
+      await _pollOnce();
+      if (!_polling) break;
+      await Future<void>.delayed(_pollInterval);
+    }
+  }
+
+  /// One poll cycle: `getstate` (the health signal) plus `getsetting`
+  /// for shutter / ISO / aperture. A `getstate` failure increments
+  /// the fail counter; three in a row → connection lost. The three
+  /// `getsetting` reads are best-effort — a miss leaves that value
+  /// stale until the next cycle.
+  Future<void> _pollOnce() async {
+    final camera = _camera;
+    if (camera == null) return;
+
+    CameraState? state;
+    try {
+      state = parseGetState(await camera.getState());
+    } catch (_) {
+      state = null;
+    }
+    if (!_polling) return;
+    if (state == null) {
+      _pollFailCount++;
+      if (_pollFailCount >= 3) {
+        await _failTo('Connection to camera lost');
+      }
+      return;
+    }
+    _cameraState = state;
+    _pollFailCount = 0;
+
+    for (final type in const ['shtrspeed', 'iso', 'focal']) {
+      if (!_polling) return;
+      try {
+        final value = parseGetSetting(await camera.getSetting(type), type);
+        if (value != null) {
+          switch (type) {
+            case 'shtrspeed':
+              _shutterWire = value;
+            case 'iso':
+              _isoWire = value;
+            case 'focal':
+              _focalWire = value;
+          }
+        }
+      } catch (_) {
+        // Tolerated — the value stays stale until the next cycle.
+      }
+    }
+    if (_polling) notifyListeners();
+  }
+
   /// Disconnect: polite-goodbye sequence via the transport, plus
   /// state-machine reset.
   Future<void> disconnect() async {
+    _stopPolling();
     await stopLivePreview();
     final camera = _camera;
     if (camera != null) {
@@ -324,6 +456,7 @@ class CameraConnection extends ChangeNotifier {
   /// Tear down + record the error text + set state = error. Used by
   /// the connect path on any failure.
   Future<void> _failTo(String message) async {
+    _stopPolling();
     await stopLivePreview();
     final camera = _camera;
     if (camera != null) {
@@ -346,7 +479,7 @@ class CameraConnection extends ChangeNotifier {
   @override
   void dispose() {
     // Best-effort teardown; we don't await since dispose is sync.
-    _previewKeepAlive?.cancel();
+    _stopPolling();
     _previewSub?.cancel();
     _previewStream?.close();
     _previewImage.value?.dispose();

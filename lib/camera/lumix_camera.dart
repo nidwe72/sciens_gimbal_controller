@@ -21,7 +21,10 @@ import 'lumix_protocol.dart';
 /// See SPEC-flutter-app.md Phase 2.
 
 class LumixCamera {
-  LumixCamera({this.httpTimeout = const Duration(seconds: 5)});
+  LumixCamera({
+    this.httpTimeout = const Duration(seconds: 5),
+    http.Client? httpClient,
+  }) : _httpClient = httpClient ?? http.Client();
 
   /// Per-request HTTP timeout (overridden for [accCtrl] which has a
   /// much longer body-side-prompt window).
@@ -48,7 +51,7 @@ class LumixCamera {
   static const String _ssdpAddress = '239.255.255.250';
   static const int _ssdpPort = 1900;
 
-  final http.Client _httpClient = http.Client();
+  final http.Client _httpClient;
   final _HttpRequestQueue _queue = _HttpRequestQueue();
 
   /// Set after a successful [discover] (or after the manual fallback).
@@ -257,6 +260,12 @@ class LumixCamera {
       _request(urlStartStream(_requireIp(), udpPort));
 
   Future<String> stopStream() => _request(urlStopStream(_requireIp()));
+
+  /// Issue an arbitrary `cam.cgi` request built from [query]. Goes
+  /// through the same FIFO queue as the typed endpoints above. Used by
+  /// the diagnostics tool to probe endpoints the typed API omits.
+  Future<String> rawGet(Map<String, String> query) =>
+      _request(urlRaw(_requireIp(), query));
 
   String _requireIp() {
     final ip = _cameraIp;
