@@ -2611,14 +2611,478 @@ live preview shimmers. The Virtual Lumix S5 tab's mode dial and
 battery slider drive the camera tab's readouts via the normal poll
 path.
 
+#### PR 10 — Capture delay + capture sounds
+
+**Scope.** Two small camera-tab additions that finish the deferred
+PR 6 self-timer piece: a software-driven capture delay, and audible
+shutter / beep cues during capture.
+
+**Capture delay (software-only).** A text field labelled
+"Capture delay (s)" — accepts **non-negative integers only**,
+**unbounded**, default `0`. The camera body's own self-timer is
+**not** used; the delay is a software countdown inside the app, so
+the count, the cancel affordance and the beep cadence are all under
+our control. Tapping **Capture** with delay > 0 starts the
+countdown — the button relabels to **Cancel**, and an inline
+"Capturing in N…" line counts down beside it. At T = 0 the
+existing `CameraConnection.capture()` runs — the same call used
+today for delay = 0. Tapping **Cancel** during the countdown
+aborts the firing: no shutter call, no further beeps, button
+returns to **Capture**. When the app is backgrounded
+mid-countdown the countdown is aborted (so the camera doesn't fire
+while the user has moved on). Independent of any Phase 4 panorama
+settle-delay (Phase 4 will have its own).
+
+**Capture sounds.** Two SFX layered above the transport:
+
+- **Shutter** — a mechanical-SLR sample, played once at T = 0 on
+  **every** capture (with or without delay). The shutter sound is
+  *not* gated on delay > 0 — an immediate capture is audibly
+  confirmed too, so the user doesn't have to look at the screen to
+  know a shot has fired.
+- **Beep** — short tone played during the countdown,
+  **Nikon-style** cadence:
+  - **Slow phase** — one beep at the start of each remaining second
+    while `seconds_remaining ≥ 3`.
+  - **Fast phase** — one beep every 0.5 s during the final 2 s, at
+    T = 2.0, 1.5, 1.0, 0.5.
+  - At T = 0 the shutter sound plays (no beep at T = 0).
+
+  Beep counts:
+  | delay N | slow beeps | fast beeps | + shutter |
+  |---:|:---:|:---:|:---:|
+  | 0 | 0 | 0 | 1 |
+  | 1 | 0 | 2 (T = 1.0, 0.5) | 1 |
+  | 2 | 0 | 4 (T = 2.0, 1.5, 1.0, 0.5) | 1 |
+  | 3 | 1 (T = 3) | 4 | 1 |
+  | 10 | 8 (T = 10…3) | 4 | 1 |
+
+A single **Mute** checkbox sits beside the delay field. Default:
+**unchecked** — i.e. sounds play. When checked, neither beep nor
+shutter is emitted (the camera still fires; the checkbox gates audio
+only).
+
+**Silent / ringer mode.** Sounds play through Android's
+**STREAM_MUSIC** (media stream). Media volume controls level; the
+device's ringer / silent mode does **not** mute them. The in-app
+Mute checkbox is the only audio mute. This is deliberate — the
+user opted in by leaving Mute unchecked.
+
+**UI placement.** The **Capture options** subsection sits above the
+Capture button, two compact rows:
+
+```
+Capture delay (s): [____]
+Mute:              [ ]
+```
+
+**Capture button.** Plain **Capture** label; no relabel during a
+countdown, no in-button spinner. The button is **disabled** while a
+capture is in flight — both for the immediate-fire delay = 0 path
+and for the delay > 0 path — and re-enables on completion or cancel.
+The previous in-button `CircularProgressIndicator` is **removed**.
+
+**Progress overlay (delay > 0 only).** A **screen-centred modal
+overlay** appears for the duration of `captureWithDelay` calls with
+a delay > 0. For **delay = 0 the overlay does not appear** —
+feedback is the shutter sound (when unmuted) and the captured still
+arriving in the pane.
+
+- The overlay is a **~50 %-opacity scrim** covering the whole screen
+  and intercepting taps so the UI underneath can't be driven during
+  capture.
+- Centred on the scrim: the dominant indicator (~120 dp diameter;
+  final size at impl time), with a small **Cancel** text button
+  rendered just below it.
+- **Countdown phase (T = N → T = 0).** Indicator is a **thick gray
+  ring** that drains from full at T = N to empty at T = 0. The
+  seconds-remaining integer renders large in the centre of the ring.
+  Cancel is active — tapping it invokes `cancelCountdown()` and the
+  overlay dismisses immediately.
+- **Firing phase (T = 0 → photo lands).** The ring + seconds number
+  give way to an **iris (camera-aperture) glyph** in the same
+  centred spot, **blinking at ~1 Hz** between gray
+  (`Theme.of(context).colorScheme.outline`) and the theme's primary
+  colour (`...colorScheme.primary`). The Cancel button is hidden —
+  an in-flight camera shot can't be cancelled.
+- **Dismissal triggers:** capture success (the still lands in the
+  pane), capture error (the existing error messages render in their
+  current location once the overlay dismisses), Cancel tap during
+  the countdown, or `AppLifecycleState.paused`.
+
+**Iris glyph.** Implemented as an SVG asset
+(`assets/icons/iris.svg`, freely-licensed; sourced at impl time
+alongside the audio clips) rendered with `flutter_svg`. Tint cycles
+via a `ColorTween` driven by a 1 Hz `AnimationController`.
+Alternative: a small `CustomPainter` 6-blade aperture if we'd
+rather skip the SVG dependency — choice deferred to impl time.
+
+**Persistence — none for this PR.** Both fields reset to defaults
+(`0` and unchecked) at every app launch. Shared-prefs persistence is
+a candidate for a later PR.
+
+**Demo Lumix S5.** Sounds layer above the transport, so the Demo
+Lumix S5 plays them too. No `DemoLumixCamera` changes;
+`CameraConnection` already drives capture identically for real and
+demo transports.
+
+**Audio package and assets.**
+
+- **Package:** `soundpool` — a thin wrapper around Android's
+  `SoundPool` API, sized for short low-latency SFX. The Flutter
+  package configures the Android stream type to **MEDIA**, satisfying
+  the ringer-bypass requirement above. (Sound playback on iOS /
+  desktop is out of scope; the Mute checkbox effectively no-ops
+  there.)
+- **Assets:** `assets/sounds/shutter.ogg` and `assets/sounds/beep.ogg`,
+  sourced under an **open license** — Freesound CC0 preferred, CC-BY
+  acceptable with attribution. Sized to fit comfortably inside the
+  APK (a shutter clip ≤ 200 KB, a beep ≤ 30 KB).
+- **Attribution:** `assets/sounds/CREDITS.txt` matches the existing
+  `assets/demo/CREDITS.txt` convention — per-clip source URL, license,
+  author.
+
+**Edits.**
+
+- `lib/camera/capture_sounds.dart` (new) — wraps `Soundpool`.
+  Abstract `CaptureSounds` interface exposing `playBeep()` and
+  `playShutter()`; a real `SoundpoolCaptureSounds` implementation
+  that lazy-loads the two clips on first use, and a
+  `NullCaptureSounds` no-op for tests. One instance per
+  `CameraConnection` lifetime; disposed on disconnect. The instance
+  reads `CameraConnection.muted` on each call and skips playback when
+  muted.
+- `lib/camera/camera_connection.dart` —
+  - `captureWithDelay(int seconds)` orchestrates the countdown, the
+    beep cadence, and the final `capture()` call. Replaces the
+    current button-driven plain `capture()` call as the entry point
+    from the UI.
+  - `ValueListenable<int?> countdownSecondsLeft` — running seconds
+    integer during the countdown phase; `null` once the firing phase
+    starts or when no capture is active.
+  - `ValueListenable<bool> overlayActive` — `true` from the moment
+    a `captureWithDelay(seconds > 0)` begins until that capture
+    completes (success, error, cancel, or app-paused abort). The UI
+    binds the overlay's visibility to this. For
+    `captureWithDelay(0)` this stays `false` throughout — the
+    overlay never appears.
+  - `cancelCountdown()` aborts a countdown in progress (no effect
+    once the firing phase has started).
+  - `ValueNotifier<bool> muted` mirrors the checkbox.
+  - A `WidgetsBindingObserver` aborts the countdown on
+    `AppLifecycleState.paused` (and clears `overlayActive`).
+- `lib/ui/tabs/camera_tab.dart` —
+  - A new `_CaptureOptions` widget (delay text field + Mute
+    checkbox) sits above the existing Capture row.
+  - A new `_CaptureOverlay` widget renders the scrim + the centred
+    indicator (the gray countdown ring during the countdown phase;
+    the animated iris glyph during firing) + the Cancel text button
+    (only during the countdown phase). It is inserted at the camera
+    tab's root as a `Stack` sibling, visible while
+    `conn.overlayActive == true`.
+  - The Capture button is simplified — no relabel, no in-button
+    spinner; just a normal button that is enabled / disabled.
+    Tapping it calls `conn.captureWithDelay(currentDelay)`.
+  - The delay field uses
+    `TextInputType.numberWithOptions(decimal: false, signed: false)`
+    and a `FilteringTextInputFormatter.digitsOnly` to enforce
+    non-negative-integer-only input.
+- `lib/camera/demo_lumix_camera.dart` — no changes.
+- `pubspec.yaml` — add `soundpool:` and `flutter_svg:` to
+  dependencies (versions pinned at impl time), and `assets/sounds/`
+  + `assets/icons/` entries. (`flutter_svg` drops out if the iris
+  is implemented as a `CustomPainter` instead.)
+- `assets/sounds/{shutter.ogg, beep.ogg, CREDITS.txt}` (new).
+- `assets/icons/iris.svg` + `assets/icons/CREDITS.txt` (new — only
+  if the SVG-asset path is chosen for the iris glyph).
+
+**Tests.**
+
+- `test/camera_connection_test.dart` extends — all under
+  `FakeAsync`:
+  - `captureWithDelay(0)`: transport's `capture()` called once
+    immediately; one `playShutter()` (when not muted); zero
+    `playBeep()`. `overlayActive` **stays false** throughout.
+  - `captureWithDelay(5)`: slow beeps at T = 5, 4, 3 (3 ticks); fast
+    beeps at T = 2.0, 1.5, 1.0, 0.5 (4 ticks); shutter at T = 0;
+    `capture()` called exactly once. `countdownSecondsLeft` ticks
+    5 → 4 → 3 → 2 → 1 → null in lockstep. `overlayActive` is
+    `true` from the call until the capture completes.
+  - `captureWithDelay(1)`: only the two fast beeps (T = 1.0, 0.5) +
+    shutter at T = 0. `overlayActive` toggles as in the 5-s case.
+  - `captureWithDelay(5)` then `cancelCountdown()` at T = 3: no
+    further beeps, no shutter, transport `capture()` never called;
+    `overlayActive` flips false on cancel.
+  - `muted = true`: 0 beeps, 0 shutter, capture still fires at T = 0.
+  - `AppLifecycleState.paused` mid-countdown: countdown aborts;
+    `capture()` not called; `overlayActive` flips false.
+- `test/capture_sounds_test.dart` (light) — `NullCaptureSounds` is a
+  no-op; the real `SoundpoolCaptureSounds` honours `muted` without
+  invoking the platform (mock the `Soundpool` boundary).
+- `test/capture_overlay_test.dart` (light widget test) — the overlay
+  appears when `overlayActive` is `true`; the centre renders the
+  ring + seconds during the countdown and the iris during firing;
+  the Cancel text button is visible during the countdown and hidden
+  during firing; tapping Cancel invokes `cancelCountdown()`.
+
+**Verifies on hardware (S5D)** — assuming the BT-paired Android
+phone per the PR 4 note:
+
+- Delay = 0, Mute unchecked: tap Capture → **no overlay**; the
+  Capture button briefly disables; shutter sound plays immediately;
+  photo lands on the card.
+- Delay = 10 s, Mute unchecked: tap Capture → screen dims to the
+  scrim; the gray countdown ring fills the centre with **10**
+  inside; the ring drains from full → empty over 10 s as the number
+  ticks 10 → 1; slow beeps for the first 8 s, fast beeps in the
+  final 2 s. At T = 0 the ring / number give way to the **iris
+  glyph blinking gray ↔ primary blue**; the shutter sound plays;
+  the exposure fires; the overlay dismisses when the captured still
+  lands in the pane.
+- Cancel mid-countdown: tap the **Cancel** text under the ring →
+  overlay dismisses immediately; no further beeps, no shutter, no
+  firing.
+- Mute checked + delay = 5: countdown overlay still appears (Mute
+  gates audio only); no shutter sound; photo still fires at T = 0.
+- Phone in silent / ringer-off mode: sounds still play.
+- App backgrounded (home button or app switcher) mid-countdown:
+  overlay dismisses; nothing fires when the app returns.
+
+**Verifies in demo mode.** Same checks against the Demo Lumix S5 —
+capture delay and sounds behave identically, since both layer above
+the transport.
+
+#### PR 11 — Devices panel & per-device connect
+
+**Scope.** App-shell restructure: the camera becomes usable
+**without** a gimbal connection (and vice versa). The startup flow
+drops `ConnectScreen`; both the gimbal and the camera are reached
+via a new **Devices panel** below the app header, one icon per
+device opening a modal bottom sheet for connect / disconnect.
+
+**Motivation.** Phase 2 has made the camera a first-class peer of
+the gimbal — but the launch flow still forces a gimbal connection
+before any camera UI is reachable. The data layer is already
+independent (`GimbalConnection` and `CameraConnection` are separate
+objects); only the shell hard-codes "gimbal first". Phase 4
+(panorama) will also need the two connections independently.
+
+**Devices panel.** A new horizontal row sits **below the app
+`Header`** and **above the tab strip**. Two `DeviceButton` widgets
+side by side:
+
+- **Camera** — camera glyph (starting candidate `Icons.camera_alt`,
+  final choice at impl time), label `Camera` underneath.
+- **Gimbal** — `Icons.joystick` (Material Icons; the vertical-stick
+  silhouette reads cleanly as a gimbal handle), label `Gimbal`
+  underneath.
+
+Each `DeviceButton` reflects the **connection state** of its
+device, derived from the corresponding connection object's existing
+state machine:
+
+- **Disconnected** — outlined icon at ~50 % opacity.
+- **Connecting** — outlined icon with a small gray ring overlaid
+  (re-use the countdown ring style from PR 10).
+- **Connected** — filled icon, tinted with
+  `Theme.of(context).colorScheme.primary`.
+
+Tapping a button opens a **modal bottom sheet**
+(`showModalBottomSheet`) for that device. The button stays
+tappable in the **connecting** state too — opening the sheet then
+surfaces the in-progress connection (spinner + status) rather
+than a fresh scan list.
+
+**Modal bottom sheets.** Two sheets, each holding the full
+connect / disconnect UX for its device:
+
+- **Gimbal sheet** (`lib/ui/sheets/gimbal_sheet.dart`, new) —
+  carries today's `ConnectScreen` content: BLE scan list, Demo
+  Gimbal entry, connect / cancel-scan controls. When the gimbal is
+  already connected, the sheet shows a **Disconnect** button
+  instead, with a summary line (device name + MAC + MTU).
+- **Camera sheet** (`lib/ui/sheets/camera_sheet.dart`, new) —
+  carries today's `_DisconnectedView` content from
+  `camera_tab.dart`: WiFi-side scan / direct-IP connect, Demo Lumix
+  S5 entry. When connected, the sheet shows a **Disconnect** button
+  with the connected camera's summary line.
+
+Both sheets dismiss when their connect attempt completes
+(transitions to Connected) or when the user taps outside the sheet
+/ swipes it down.
+
+**Tab structure & naming.**
+
+- **Gimbal** — **renamed** from the `pan/tilt/roll` tab label to
+  `gimbal` (lowercase, matching the existing `camera` / `logs`
+  labels). File `gimbal_tab.dart` (via `git mv` from
+  `controls_tab.dart`); class `GimbalTab` (from `ControlsTab`).
+  When the gimbal is connected, the tab body shows today's controls
+  + 3D visualization unchanged. When disconnected, a centred
+  placeholder: **"Connect a gimbal — tap the gimbal icon above."**
+- **Camera** — name unchanged. When the camera is connected, the
+  tab body shows today's connected-camera UI (live preview,
+  controls, capture, captured-still pane, the PR 10 capture
+  overlay). When disconnected, a centred placeholder:
+  **"Connect a camera — tap the camera icon above."** The tab no
+  longer hosts any connect controls of its own.
+- **Logs** — unchanged.
+- **Virtual Lumix S5** (PR 9) — unchanged: appears only when the
+  Demo Lumix S5 is the connected camera.
+
+**Launch flow.** `main.dart` opens directly to `PlaygroundScreen`
+with both devices in the **disconnected** state. No auto-popup of
+any connect sheet. The user reaches a connect sheet by tapping the
+matching device icon in the Devices panel.
+
+**Connection persistence.** Switching tabs and brief app
+backgrounding (`AppLifecycleState.paused`) do **not** drop either
+connection. Connections drop only on explicit **Disconnect** in the
+sheet, or on hardware / network loss (BLE link loss, WiFi network
+change). After a drop, the device icon returns to its disconnected
+state, the corresponding tab body switches to the "Connect …"
+placeholder, and the other device is unaffected.
+
+**Capture overlay interaction (PR 10).** The PR 10 capture overlay
+scrims the **camera tab's content area only** — the header and the
+Devices panel remain visible during a countdown. The user can still
+see device state through the overlay; disconnecting either device
+mid-countdown via its sheet is allowed but not a required
+interaction.
+
+**Edits.**
+
+- `lib/ui/devices_panel.dart` (new) — the horizontal row holding
+  two `DeviceButton`s; reads both connections' states.
+- `lib/ui/device_button.dart` (new) — single button widget
+  parameterised by icon, label, the connection-state value, and an
+  `onTap` callback. Renders the three visual states.
+- `lib/ui/sheets/gimbal_sheet.dart` (new) — modal sheet content
+  for the gimbal device; takes the `GimbalConnection`. Re-uses the
+  existing scan-list inner widgets (`device_row.dart` etc.).
+- `lib/ui/sheets/camera_sheet.dart` (new) — modal sheet content
+  for the camera device; takes the `CameraConnection`. Re-uses the
+  scan / direct-IP / Demo Lumix UI extracted from
+  `camera_tab.dart`'s `_DisconnectedView`.
+- `lib/ui/playground_screen.dart` — no longer assumes a connected
+  gimbal. Inserts the Devices panel between the header and the tab
+  strip. Each tab body renders either the connected content or the
+  "Connect a {gimbal,camera}" placeholder, gated on the matching
+  connection's state.
+- `lib/ui/tabs/gimbal_tab.dart` — renamed from
+  `lib/ui/tabs/controls_tab.dart` via `git mv`. Body content
+  unchanged except for the disconnected-placeholder branch.
+- `lib/ui/tabs/camera_tab.dart` — remove `_DisconnectedView`,
+  `_ConnectingView`, the manual-IP toggle state, and the `switch`
+  on `CameraStatus` in `_CameraControlsTab.build` — that logic
+  moves into `camera_sheet.dart`. The tab body collapses to
+  `if (isConnected) return _ConnectedView else return
+  _CameraPlaceholder`. The **in-tab Disconnect button** on
+  `_ConnectedView` is also removed — disconnect is now solely
+  through the camera sheet.
+- `lib/main.dart` — drop the `ConnectScreen` push; launch
+  `PlaygroundScreen` directly. The two connection objects are
+  constructed at app start and held by the root widget (today's
+  pattern; no change to who owns them).
+- `lib/ui/connect_screen.dart` — **deleted**. Shared inner widgets
+  it used (e.g. `device_row.dart`) stay where they are.
+
+**Implementation steps.** Eight phases, each committed independently
+and leaving the build green:
+
+1. **`DeviceButton` + `DeviceState`.** New `lib/ui/device_button.dart`
+   — the enum and the widget rendering the three visual states.
+   Widget tests cover all three states + tap. Unused yet.
+2. **Gimbal sheet.** New `lib/ui/sheets/gimbal_sheet.dart`. Extract
+   the body of `ConnectScreen` (scan lifecycle, scan-toggle, status
+   row, `ListView.separated`, BLE permissions) and the
+   `_DeviceRowTile` into the sheet. Add a "connected" branch
+   (summary + Disconnect). `ConnectScreen` itself stays intact.
+3. **Camera sheet.** New `lib/ui/sheets/camera_sheet.dart`. Extract
+   `_DisconnectedView` + `_ConnectingView` from `camera_tab.dart`;
+   move the manual-IP toggle state into the sheet. Add a
+   "connected" branch (summary + Disconnect). Originals in
+   `camera_tab.dart` remain intact.
+4. **`DevicesPanel`.** New `lib/ui/devices_panel.dart`. `ConsumerWidget`
+   watching both connection providers, mapping to `DeviceState`,
+   rendering two `DeviceButton`s in a row. Each `onTap` opens the
+   matching sheet via
+   `showModalBottomSheet(isScrollControlled: true, ...)`.
+5. **`PlaygroundScreen` restructure.** Drop the kick-back-to-Connect
+   logic; replace `_ConnectionSummary` with `const DevicesPanel()`;
+   rename the `pan/tilt/roll` tab label → `gimbal`; simplify the
+   PopScope cleanup (no more `pushReplacement(ConnectScreen)`).
+   `ConnectScreen` is still the launch screen at this phase.
+6. **Camera tab simplification.** Delete `_DisconnectedView`,
+   `_ConnectingView`, the `CameraStatus` switch, the manual-IP
+   toggle state, and the in-tab Disconnect button. The tab body
+   collapses to the if/else placeholder pattern.
+7. **Gimbal tab rename + placeholder.** `git mv controls_tab.dart
+   gimbal_tab.dart`; rename `ControlsTab` → `GimbalTab`; add the
+   early `if (!isConnected) return _GimbalPlaceholder` branch.
+   Update `playground_screen.dart` import + constructor name.
+8. **Launch cutover + delete dead code.** Point `main.dart` at
+   `PlaygroundScreen`; `git rm lib/ui/connect_screen.dart`; tidy
+   imports.
+
+**Tests.**
+
+- `test/widget/devices_panel_test.dart` (new) — three states per
+  device: disconnected icon is dimmed; connecting overlay shows the
+  ring; connected icon is filled and tinted. Tap dispatches the
+  callback.
+- `test/widget/playground_screen_test.dart` (new) — placeholder
+  text appears in each tab body when its device is disconnected
+  and the connected content appears when connected. Both states
+  driven by fake `GimbalConnection` / `CameraConnection`.
+- Existing `camera_connection_test.dart`,
+  `demo_gimbal_transport_test.dart`, `frame_codec_test.dart` etc.
+  are unaffected — the data layer is untouched.
+
+**Verifies (demo + real hardware).**
+
+- **Cold launch.** Both devices disconnected. PlaygroundScreen
+  appears immediately; tab bodies show "Connect a …" placeholders;
+  the tab strip is Gimbal + Camera + Logs.
+- **Connect camera first (demo).** Tap the **Camera** icon → camera
+  sheet slides up. Select Demo Lumix S5 → sheet dismisses, Camera
+  icon flips to filled blue; Camera tab body switches to the
+  connected view; the Virtual Lumix S5 tab appears in the tab
+  strip. The Gimbal icon and tab remain in their disconnected
+  state.
+- **Connect gimbal independently (demo).** Tap the **Gimbal** icon
+  → gimbal sheet slides up. Select Demo Gimbal → Gimbal icon flips
+  to filled blue; Gimbal tab body switches to the connected
+  content (3D visualization etc.). The Camera connection is
+  unaffected.
+- **PR 10 capture from the connected camera.** Tap Capture (with or
+  without a delay) → behaviour is unchanged from PR 10. The header
+  + Devices panel remain visible through the capture overlay.
+- **Disconnect one device.** Tap the connected **Camera** icon →
+  sheet opens with Disconnect + summary; tap Disconnect → icon
+  reverts to dimmed, Camera tab returns to its placeholder. The
+  Gimbal connection is untouched. Same flow inverted for the
+  Gimbal.
+- **App background / resume.** Background the app for ~30 s, then
+  resume — both connections persist; device icons stay filled.
+- **Real hardware.** Same matrix against a real SCORP-C2 +
+  S5D — sheets list real-device entries; connect / disconnect on
+  one side does not perturb the other.
+
 #### Sign-off
 
 PR 6 (EV compensation), PR 7, PR 8 and PR 9 have all landed and
-their on-hardware verification checkpoints pass. The remaining
-Phase 2 piece — the PR 6 single-shot self-timer / capture-delay —
-is being re-specified separately. Once that ships, Phase 2 is
-complete; next is Phase 3 (protocol library extraction) or
-Phase 4 (panorama sequencer) — order optional.
+their on-hardware verification checkpoints pass. Two specified
+pieces remain before Phase 2 closes:
+
+- **PR 10 — Capture delay + capture sounds** — the deferred PR 6
+  single-shot self-timer, respec'd with audible cues.
+- **PR 11 — Devices panel & per-device connect** — app-shell
+  restructure so the camera is usable without a gimbal.
+
+Once both land, Phase 2 is complete; next is Phase 3 (protocol
+library extraction) or Phase 4 (panorama sequencer) — order
+optional.
 
 ### Out of scope (Phase 2)
 
@@ -2857,8 +3321,8 @@ The "PR 3.5 — auth handshake for hardened firmware" task is now
 device that has *not* been BT-paired via LUMIX Sync.
 
 PR 5 and PR 6's EV-compensation have since landed and verified on
-hardware. The PR 6 single-shot self-timer / capture-delay is the
-remaining Phase 2 piece — to be re-specified separately.
+hardware. The PR 6 single-shot self-timer is now specified as
+PR 10 (capture delay + capture sounds), pending implementation.
 
 ## Phase 3 — protocol library (outline only)
 
