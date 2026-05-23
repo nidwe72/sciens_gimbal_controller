@@ -4,7 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../camera/camera_connection.dart';
 import '../camera/camera_diagnostics.dart';
 import '../state/gimbal_connection.dart';
-import 'connect_screen.dart';
+import 'devices_panel.dart';
 import 'header.dart';
 import 'tabs/camera_tab.dart';
 import 'tabs/controls_tab.dart';
@@ -60,19 +60,6 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
 
   @override
   Widget build(BuildContext context) {
-    final conn = ref.watch(gimbalConnectionProvider);
-
-    // If the connection dropped, kick back to ConnectScreen.
-    if (!conn.connecting && !conn.isConnected) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (context.mounted) {
-          Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const ConnectScreen()),
-          );
-        }
-      });
-    }
-
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) async {
@@ -80,25 +67,20 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
         // Disconnect both transports cleanly, and stop the diagnostics
         // HTTP server so no socket is orphaned.
         await ref.read(cameraDiagnosticsProvider).stopServer();
-        final cam = ref.read(cameraConnectionProvider);
-        await cam.disconnect();
-        await conn.disconnect();
-        if (context.mounted) {
-          Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const ConnectScreen()),
-          );
-        }
+        await ref.read(cameraConnectionProvider).disconnect();
+        await ref.read(gimbalConnectionProvider).disconnect();
+        if (context.mounted) Navigator.of(context).pop();
       },
       child: Scaffold(
         appBar: const AppHeader(),
         body: Column(
           children: [
-            _ConnectionSummary(conn: conn),
+            const DevicesPanel(),
             const Divider(height: 1),
             TabBar(
               controller: _tabController,
               tabs: const [
-                Tab(text: 'pan/tilt/roll'),
+                Tab(text: 'gimbal'),
                 Tab(text: 'camera'),
                 Tab(text: 'logs'),
               ],
@@ -127,47 +109,3 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
   }
 }
 
-class _ConnectionSummary extends StatelessWidget {
-  const _ConnectionSummary({required this.conn});
-  final GimbalConnection conn;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Row(
-        children: [
-          Icon(Icons.bluetooth_connected, color: theme.colorScheme.primary),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  conn.connectedName ?? '(no device)',
-                  style: theme.textTheme.titleMedium,
-                ),
-                Text(
-                  '${conn.connectedId ?? "—"}   MTU: ${conn.mtu ?? "—"}',
-                  style: theme.textTheme.bodySmall,
-                ),
-              ],
-            ),
-          ),
-          TextButton.icon(
-            onPressed: () async {
-              await conn.disconnect();
-              if (!context.mounted) return;
-              Navigator.of(context).pushReplacement(
-                MaterialPageRoute(builder: (_) => const ConnectScreen()),
-              );
-            },
-            icon: const Icon(Icons.link_off, size: 18),
-            label: const Text('Disconnect'),
-          ),
-        ],
-      ),
-    );
-  }
-}
