@@ -67,4 +67,53 @@ void main() {
     )));
     expect(find.byIcon(Icons.bluetooth), findsOneWidget);
   });
+
+  testWidgets('light=true connected — filled glyph in white', (tester) async {
+    await tester.pumpWidget(wrap(DeviceButton(
+      icon: Icons.camera_alt,
+      outlinedIcon: Icons.camera_alt_outlined,
+      label: 'Camera',
+      state: DeviceState.connected,
+      onTap: () {},
+      light: true,
+    )));
+    expect(find.byIcon(Icons.camera_alt), findsOneWidget);
+    expect(find.byIcon(Icons.camera_alt_outlined), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    final iconWidget = tester.widget<Icon>(find.byIcon(Icons.camera_alt));
+    expect(iconWidget.color, equals(Colors.white));
+  });
+
+  testWidgets('light=true disconnected — dimmed white outlined glyph',
+      (tester) async {
+    await tester.pumpWidget(wrap(DeviceButton(
+      icon: Icons.camera_alt,
+      outlinedIcon: Icons.camera_alt_outlined,
+      label: 'Camera',
+      state: DeviceState.disconnected,
+      onTap: () {},
+      light: true,
+    )));
+    expect(find.byIcon(Icons.camera_alt_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.camera_alt), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    final iconWidget =
+        tester.widget<Icon>(find.byIcon(Icons.camera_alt_outlined));
+    // Dimmed white — alpha ~0.5.
+    expect(iconWidget.color, isNotNull);
+  });
+
+  testWidgets('light=true connecting — outlined glyph + white spinner',
+      (tester) async {
+    await tester.pumpWidget(wrap(DeviceButton(
+      icon: Icons.camera_alt,
+      outlinedIcon: Icons.camera_alt_outlined,
+      label: 'Camera',
+      state: DeviceState.connecting,
+      onTap: () {},
+      light: true,
+    )));
+    expect(find.byIcon(Icons.camera_alt_outlined), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+  });
 }

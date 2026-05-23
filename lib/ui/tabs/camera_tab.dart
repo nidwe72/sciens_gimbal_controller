@@ -94,17 +94,17 @@ class _CameraTabState extends ConsumerState<CameraTab>
         children: [
           TabBar(
             tabs: [
-              const Tab(text: 'Camera'),
-              const Tab(text: 'Debug/Diagnostics'),
+              const Tab(text: 'Capture'),
               if (isDemo) const Tab(text: 'Virtual S5'),
+              const Tab(text: 'Debug/Diagnostics'),
             ],
           ),
           Expanded(
             child: TabBarView(
               children: [
                 const _CameraControlsTab(),
-                const CameraDiagnosticsView(),
                 if (isDemo) const _VirtualLumixTab(),
+                const CameraDiagnosticsView(),
               ],
             ),
           ),

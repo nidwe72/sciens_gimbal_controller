@@ -3069,18 +3069,243 @@ and leaving the build green:
   S5D — sheets list real-device entries; connect / disconnect on
   one side does not perturb the other.
 
+#### PR 11 — Header redesign (follow-up)
+
+**Scope.** Follow-up to the PR 11 devices panel: re-brand the app
+shell around the Panoramique identity and absorb the standalone
+`DevicesPanel` row from the original PR 11 wave into the right
+side of the app header. After this follow-up the header is the
+only row above the tab strip.
+
+**Motivation.** Phase 4's panorama workflow is the app's reason
+for existing — the brand should say so. The previous
+"Sciens Gimbal Controller" title was a remnant of Phase 0 when the
+gimbal was the main act. The new tagline is punchier and names the
+"vintage glass on a modern body + gimbal" workflow without
+spelling it out. Folding the devices panel into the header (it's
+two icons; their slot is small) tightens the layout and frees the
+row below the header for the tab strip alone.
+
+**Layout.**
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ [appIcon]  Panoramique                       [cam]     [gimbal] │
+│ sciens.at  old glass, wide world            Camera    Gimbal   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- **Left.** The existing Android launcher icon (from
+  `android/app/src/main/res/mipmap-*/ic_launcher.png`) rendered at
+  about 40–48 dp, with `sciens.at` directly underneath in small
+  (~11 sp), lowercase, slightly faded text — a watermark, no
+  link-out.
+- **Centre-left.** `Panoramique` as the main title (Material 3
+  `titleLarge` or similar), with the tagline `old glass, wide world`
+  beneath in `bodySmall` and a subtle onSurface dim.
+- **Right.** The two `DeviceButton`s from PR 11, side by side, with
+  their `Camera` / `Gimbal` labels kept underneath each icon.
+  Three visual states unchanged (dimmed outline / outline + small
+  ring / filled tinted). Each opens its matching modal sheet on
+  tap, exactly as today.
+
+The `AppHeader`'s `preferredSize.height` grows to host the two-line
+content + labelled device buttons — roughly **72–80 dp** of fixed
+height, finalised at impl time. The `PlaygroundScreen` body Column
+becomes `AppHeader → Divider → TabBar → TabBarView`; the
+standalone `DevicesPanel` row introduced in PR 11 is removed.
+
+**Identity changes.**
+
+- **In-app title** in the header — `Sciens Gimbal Controller` →
+  `Panoramique`.
+- **`MaterialApp(title: …)`** in `main.dart` — `Sciens Gimbal
+  Controller` → `Panoramique (Sciens)`. This is what the Android
+  task switcher (recents) shows.
+- **Android launcher label** — `android:label` in
+  `AndroidManifest.xml` → `Panoramique (Sciens)`. The parenthetical
+  keeps the `Sciens` cue on the home screen so the app remains
+  recognisable.
+- **Tagline** — `old glas goes digital` → `old glass, wide world`.
+- **Dart package name** — stays `sciens_gimbal_controller`.
+- **Android `applicationId`** — stays `at.sciens.gimbal_controller`.
+  Renaming would force a reinstall and a re-pair of the gimbal;
+  not worth it for a brand change.
+- **App icon** — unchanged for this PR. The existing launcher
+  icons are reused both on the home screen and in the header's
+  left region. Can be revisited later.
+
+**Edits.**
+
+- `lib/ui/header.dart` — rebuild `AppHeader` end-to-end:
+  - Left region: an `Image.asset` or `Image` resolving the launcher
+    icon (`android/app/src/main/res/mipmap-mdpi/ic_launcher.png` or
+    the highest-density variant rendered down), with `sciens.at`
+    below.
+  - Centre region: a `Column` with `Panoramique` (`titleLarge`) on
+    top and `old glass, wide world` (`bodySmall`, dimmed)
+    below. Padded with breathing room from the icon column.
+  - Right region: a `Row` of two `DeviceButton`s, populated by the
+    same state-mapping helpers that live in `devices_panel.dart`
+    today (`_cameraState`, `_gimbalState`, `_openSheet`) — moved
+    into this file.
+  - `preferredSize` returns `Size.fromHeight(76)` (or the final
+    chosen value).
+- `lib/ui/playground_screen.dart` — drop the
+  `const DevicesPanel()` child from the body Column. The Column
+  becomes `[Divider, TabBar, Expanded(TabBarView)]` (or just
+  `[TabBar, Expanded(TabBarView)]` if the divider also goes; final
+  call at impl time).
+- `lib/ui/devices_panel.dart` — **deleted** via `git rm`. Its two
+  `DeviceButton` instantiations + state-mapping helpers move into
+  `header.dart`.
+- `lib/main.dart` — `MaterialApp(title: 'Sciens Gimbal Controller')`
+  → `MaterialApp(title: 'Panoramique (Sciens)')`.
+- `android/app/src/main/AndroidManifest.xml` — the application's
+  `android:label` → `Panoramique (Sciens)`.
+- `assets/` — no new assets in this PR; existing launcher icons
+  are reused for the header.
+
+**Tests.**
+
+- The PR 11 `test/device_button_test.dart` widget tests stay green
+  unchanged — `DeviceButton` itself is untouched.
+- Light, optional addition: a `test/header_test.dart` that
+  pump-tests `AppHeader` against fake connection providers and
+  asserts the three regions render (icon, `Panoramique` text,
+  tagline text, two `DeviceButton`s with the right states).
+  Low priority; covered by manual verification.
+
+**Verifies on device.**
+
+- The Android launcher shows the icon labelled
+  `Panoramique (Sciens)` (after reinstall — Android caches labels).
+- The app header renders in one row containing: the launcher icon
+  with `sciens.at` beneath, `Panoramique` as the title with
+  `old glass, wide world` beneath, and the two `DeviceButton`s
+  (with `Camera` / `Gimbal` labels) on the right. No
+  standalone devices-panel row below the header any more.
+- Tapping `Camera` / `Gimbal` icons in the header still opens the
+  matching modal sheet (no functional change from PR 11).
+- All connect / disconnect / placeholder behaviour from PR 11's
+  verification matrix still works — this PR is purely visual.
+
+**Implementation steps.** Two phases:
+
+1. **Restructure the header.** Rebuild `lib/ui/header.dart` with
+   the three regions and the bumped `preferredSize`. Move the
+   state-mapping helpers + `DeviceButton` instantiations in from
+   `devices_panel.dart`. Update `lib/main.dart`'s `MaterialApp.title`
+   and the Android `android:label`. `PlaygroundScreen` still hosts
+   the standalone `DevicesPanel` row at this phase — the device
+   buttons appear twice (once in the header, once below it). Visual
+   verification confirms the header looks right before phase 2
+   removes the duplicate.
+2. **Remove the old DevicesPanel.** Drop `const DevicesPanel()`
+   from `playground_screen.dart`; `git rm lib/ui/devices_panel.dart`.
+   Header is the sole devices surface.
+
+**As built — additions beyond the original plan.** The header
+rebrand shipped roughly as specced, but rapid on-device iteration
+turned this into the larger app-shell restructure described below.
+Final state:
+
+- **Custom Sciens brand mark.** Instead of reusing the launcher
+  PNG verbatim, a hand-crafted SVG (`assets/branding/sciens.svg` —
+  a capital S in a rounded square border) is rendered via
+  `flutter_svg` and tinted white via a `ColorFilter`.
+  `flutter_svg: ^2.0.10` added to dependencies.
+- **Launcher icon regenerated from the same mark.** A
+  launcher-variant SVG (`assets/branding/launcher_icon.svg`) with
+  a full-bleed `#263238` primary-blue background + the white S
+  mark gets rasterised to PNG at the five mipmap densities
+  (mdpi 48 / hdpi 72 / xhdpi 96 / xxhdpi 144 / xxxhdpi 192) via
+  `rsvg-convert`, overwriting the previous defaults. Home-screen
+  icon and in-header mark now share a design.
+- **`DeviceButton.light` variant (PR 11 widget extension).** The
+  original button colours (primary-tinted for connected, dimmed
+  onSurface for the others) were invisible against the header's
+  `colorScheme.primary` background. Added an opt-in
+  `light: true` flag that renders the three states in
+  white-themed variants — solid white for connected, white-at-50 %
+  for disconnected / connecting, white-at-60 % for labels, white
+  spinner during connecting. The header passes `light: true`;
+  default behaviour is preserved. Three new tests cover the light
+  variant (eight total in `test/device_button_test.dart`).
+- **Title size.** `Panoramique` shrunk from `titleLarge` to
+  `titleMedium` (~16 sp) — the larger size felt over-weighted
+  on-device.
+- **App-shell layout shift — outer TabBar → bottom NavigationBar.**
+  The original spec kept the device-selection `TabBar` directly
+  below the header. On-device this stacked awkwardly with each
+  device's inner sub-tabs. The final layout instead replaces the
+  outer `TabBar` with a Material 3 `NavigationBar` at the bottom of
+  the `Scaffold` (`bottomNavigationBar` slot), with two
+  `NavigationDestination`s:
+  - **Camera** — `Icons.camera_alt_outlined` / selected
+    `Icons.camera_alt`.
+  - **Gimbal** — `Icons.sports_esports_outlined` / selected
+    `Icons.sports_esports`.
+  The body is an `IndexedStack(index: _selectedIndex)` so both
+  pages stay mounted (camera live preview + sub-tab selection
+  survive device switching, no need for the
+  `AutomaticKeepAliveClientMixin` plumbing the previous
+  `TabBarView` relied on). Swipe between outer destinations is
+  intentionally gone — bottom-nav destinations are tapped, not
+  swiped. The top and bottom surfaces (inner `TabBar` vs bottom
+  `NavigationBar`) are visually distinct M3 components, so the UI
+  no longer reads as "two stacked tab bars".
+- **Per-device sub-tabs and renames.** Each `NavigationDestination`
+  body has its own top `TabBar`:
+  - Camera body: **Capture** (the connected-camera UI, formerly
+    "Camera") → **Virtual S5** (shown only while the Demo Lumix
+    S5 is the connected camera; demo-only) → **Debug/Diagnostics**.
+  - Gimbal body: **Control** (the 3D viz + pan/tilt/level
+    controls, or the placeholder when disconnected; formerly
+    "Gimbal") → **Logs** (the previously top-level `LogsTab`,
+    now nested inside the gimbal destination so the bottom-nav
+    isn't cluttered with a third destination).
+- **Auto-switch destination on connect.** `PlaygroundScreen` now
+  watches each connection provider via `ref.listen` and `setState`s
+  `_selectedIndex` to the matching destination when a device
+  transitions to Connected (disconnected/connecting → connected).
+  Tapping a device icon in the header to connect → sheet
+  auto-dismisses on success → user lands on that device's
+  destination. Disconnecting does *not* change the active
+  destination.
+- **Camera-sheet double-pop bug fix.** The original
+  `camera_sheet.dart` had a `_lastStatus`-driven belt-and-braces
+  `addPostFrameCallback(maybePop)` alongside the explicit
+  `Navigator.pop()` in `_connect()` — both fired on the same
+  connect-success event, popping the sheet **and** the
+  `PlaygroundScreen` underneath it (black screen). The
+  `if (!mounted)` guard didn't save us because `mounted` only
+  flips false after the pop animation completes. Fix: drop the
+  belt-and-braces; `_connect()`'s direct pop is sufficient since
+  the only path to Connected goes through this sheet.
+- **Predictive-back fix.** Android's right-edge back gesture
+  showed a black preview because `PlaygroundScreen.PopScope` was
+  `canPop: false` and the eventual `Navigator.of(context).pop()`
+  is a no-op at the root route. Swapped to `SystemNavigator.pop()`
+  so the activity finishes (app goes to recents) when the
+  cleanup completes — matches the Android "back at root → exit"
+  UX expectation.
+
+Tagline final wording (verbatim, lowercase): `old glass, wide
+world`.
+
 #### Sign-off
 
-PR 6 (EV compensation), PR 7, PR 8 and PR 9 have all landed and
-their on-hardware verification checkpoints pass. Two specified
-pieces remain before Phase 2 closes:
+PR 6 (EV compensation), PR 7, PR 8, PR 9 and PR 11 (both the
+original devices-panel wave and the Panoramique header /
+app-shell restructure follow-up) have all landed and their
+on-device verification checkpoints pass. One specified piece
+remains before Phase 2 closes:
 
 - **PR 10 — Capture delay + capture sounds** — the deferred PR 6
   single-shot self-timer, respec'd with audible cues.
-- **PR 11 — Devices panel & per-device connect** — app-shell
-  restructure so the camera is usable without a gimbal.
 
-Once both land, Phase 2 is complete; next is Phase 3 (protocol
+Once PR 10 lands, Phase 2 is complete; next is Phase 3 (protocol
 library extraction) or Phase 4 (panorama sequencer) — order
 optional.
 

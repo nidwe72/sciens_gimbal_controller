@@ -20,6 +20,7 @@ class DeviceButton extends StatelessWidget {
     required this.label,
     required this.state,
     required this.onTap,
+    this.light = false,
   });
 
   final IconData icon;
@@ -28,6 +29,12 @@ class DeviceButton extends StatelessWidget {
   final DeviceState state;
   final VoidCallback onTap;
 
+  /// When true, render in a white-themed variant suitable for use on a
+  /// primary-coloured background (the app header). Default behaviour
+  /// (false) uses the theme's onSurface / primary colours for the three
+  /// states.
+  final bool light;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -35,16 +42,31 @@ class DeviceButton extends StatelessWidget {
 
     final Color glyphColor;
     final Color labelColor;
-    switch (state) {
-      case DeviceState.connected:
-        glyphColor = theme.colorScheme.primary;
-        labelColor = theme.colorScheme.primary;
-      case DeviceState.connecting:
-      case DeviceState.disconnected:
-        glyphColor =
-            theme.colorScheme.onSurface.withValues(alpha: 0.5);
-        labelColor =
-            theme.colorScheme.onSurface.withValues(alpha: 0.6);
+    final Color spinnerColor;
+    if (light) {
+      switch (state) {
+        case DeviceState.connected:
+          glyphColor = Colors.white;
+          labelColor = Colors.white;
+        case DeviceState.connecting:
+        case DeviceState.disconnected:
+          glyphColor = Colors.white.withValues(alpha: 0.5);
+          labelColor = Colors.white.withValues(alpha: 0.6);
+      }
+      spinnerColor = Colors.white;
+    } else {
+      switch (state) {
+        case DeviceState.connected:
+          glyphColor = theme.colorScheme.primary;
+          labelColor = theme.colorScheme.primary;
+        case DeviceState.connecting:
+        case DeviceState.disconnected:
+          glyphColor =
+              theme.colorScheme.onSurface.withValues(alpha: 0.5);
+          labelColor =
+              theme.colorScheme.onSurface.withValues(alpha: 0.6);
+      }
+      spinnerColor = theme.colorScheme.outline;
     }
 
     return InkWell(
@@ -69,7 +91,7 @@ class DeviceButton extends StatelessWidget {
                       child: CircularProgressIndicator(
                         strokeWidth: 2.5,
                         valueColor: AlwaysStoppedAnimation<Color>(
-                          theme.colorScheme.outline,
+                          spinnerColor,
                         ),
                       ),
                     ),

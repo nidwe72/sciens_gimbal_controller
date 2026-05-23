@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../state/gimbal_connection.dart';
 import '../gimbal_visualization.dart';
+import 'logs_tab.dart';
 
 /// First Playground tab. Hosts the 3D visualization (top) plus the
 /// orientation status line and the pan/tilt/level controls. Uses
@@ -41,10 +42,33 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
     super.build(context);
     final conn = ref.watch(gimbalConnectionProvider);
 
+    return DefaultTabController(
+      length: 2,
+      child: Column(
+        children: [
+          const TabBar(
+            tabs: [
+              Tab(text: 'Control'),
+              Tab(text: 'Logs'),
+            ],
+          ),
+          Expanded(
+            child: TabBarView(
+              children: [
+                _gimbalBody(conn),
+                const LogsTab(),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _gimbalBody(GimbalConnection conn) {
     if (!conn.isConnected) {
       return const _GimbalPlaceholder();
     }
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [

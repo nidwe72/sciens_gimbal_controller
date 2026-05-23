@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Source for the Android launcher icon. Same S-in-rounded-square mark
+  as sciens.svg, but with a full-bleed primary-coloured background so
+  the icon stands on its own on the home screen (vs sciens.svg, which
+  is tinted at render time by the in-app header).
+
+  Regenerate the five ic_launcher.png variants from this file with
+  rsvg-convert (mdpi 48 / hdpi 72 / xhdpi 96 / xxhdpi 144 / xxxhdpi 192).
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 100 100">
+  <rect x="0" y="0" width="100" height="100" fill="#263238" />
+  <rect x="14" y="14" width="72" height="72" rx="14" ry="14"
+        fill="none"
+        stroke="white"
+        stroke-width="6"
+        stroke-linejoin="round" />
+  <text x="50" y="66"
+        font-family="sans-serif"
+        font-size="50"
+        font-weight="700"
+        text-anchor="middle"
+        fill="white">S</text>
+</svg>

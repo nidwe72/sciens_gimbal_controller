@@ -1,5 +1,5 @@
 name: sciens_gimbal_controller
-description: "Sciens Gimbal Controller - old glass goes digital"
+description: "Panoramique (Sciens) — old glass, wide world"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_blue_plus: ^2.3.2
   flutter_riverpod: ^3.3.1
+  flutter_svg: ^2.0.10
   http: ^1.2.0
   permission_handler: ^12.0.1
   vector_math: ^2.2.0
@@ -65,8 +66,10 @@ flutter:
   uses-material-design: true
 
   # Demo Lumix S5 — the synthetic camera image (PR 9).
+  # Branding — the sciens.svg mark used in the app header (PR 11 follow-up).
   assets:
     - assets/demo/
+    - assets/branding/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

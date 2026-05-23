@@ -13,7 +13,7 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <application
-        android:label="Sciens Gimbal Controller"
+        android:label="Panoramique (Sciens)"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

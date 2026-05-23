@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sciens brand mark: a capital S inside a rounded square border.
+  Stroke uses currentColor so flutter_svg can tint it (default,
+  white on the primary header background, etc).
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 100 100">
+  <!-- Rounded square border -->
+  <rect x="10" y="10" width="80" height="80" rx="16" ry="16"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="6"
+        stroke-linejoin="round" />
+  <!-- S letter — explicit baseline (y at baseline, not text center)
+       to dodge cross-renderer differences in dominant-baseline. -->
+  <text x="50" y="68"
+        font-family="sans-serif"
+        font-size="56"
+        font-weight="700"
+        text-anchor="middle"
+        fill="currentColor">S</text>
+</svg>
