@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'ui/connect_screen.dart';
+import 'ui/playground_screen.dart';
 
 void main() {
   runApp(const ProviderScope(child: SciensGimbalControllerApp()));
@@ -19,7 +19,7 @@ class SciensGimbalControllerApp extends StatelessWidget {
         useMaterial3: true,
         colorSchemeSeed: const Color(0xFF263238),
       ),
-      home: const ConnectScreen(),
+      home: const PlaygroundScreen(),
     );
   }
 }
