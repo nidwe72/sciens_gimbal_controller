@@ -130,32 +130,6 @@ class _CameraControlsTabState extends ConsumerState<_CameraControlsTab>
   @override
   bool get wantKeepAlive => true;
 
-  final _manualIpController = TextEditingController(text: '192.168.54.1');
-  bool _showManualIp = false;
-
-  @override
-  void dispose() {
-    _manualIpController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _connect({String? manualIp, bool demo = false}) async {
-    final conn = ref.read(cameraConnectionProvider);
-    final ok = await conn.connect(manualIp: manualIp, demo: demo);
-    if (!ok && mounted) {
-      // If auto-discovery failed, surface the manual-IP entry row
-      // so the user can retry with an explicit IP.
-      if (manualIp == null && !demo) {
-        setState(() => _showManualIp = true);
-      }
-    }
-  }
-
-  Future<void> _disconnect() async {
-    final conn = ref.read(cameraConnectionProvider);
-    await conn.disconnect();
-  }
-
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -168,183 +142,43 @@ class _CameraControlsTabState extends ConsumerState<_CameraControlsTab>
     // the JPEG decode is skipped.
     conn.setPreviewPaused(!TickerMode.valuesOf(context).enabled);
 
+    if (!conn.isConnected) {
+      return const _CameraPlaceholder();
+    }
+
     return Padding(
       padding: const EdgeInsets.all(16),
       child: SingleChildScrollView(
-        child: switch (conn.status) {
-          CameraStatus.disconnected || CameraStatus.error =>
-            _DisconnectedView(
-              conn: conn,
-              showManualIp: _showManualIp,
-              manualIpController: _manualIpController,
-              onToggleManualIp: () =>
-                  setState(() => _showManualIp = !_showManualIp),
-              onConnect: () => _connect(),
-              onConnectManual: () => _connect(
-                manualIp: _manualIpController.text.trim(),
-              ),
-              onConnectDemo: () => _connect(demo: true),
-            ),
-          CameraStatus.discovering ||
-          CameraStatus.registering ||
-          CameraStatus.loadingCaps =>
-            _ConnectingView(conn: conn),
-          CameraStatus.connected => _ConnectedView(
-              conn: conn,
-              onDisconnect: _disconnect,
-            ),
-        },
+        child: _ConnectedView(conn: conn),
       ),
     );
   }
 }
 
-class _DisconnectedView extends StatelessWidget {
-  const _DisconnectedView({
-    required this.conn,
-    required this.showManualIp,
-    required this.manualIpController,
-    required this.onToggleManualIp,
-    required this.onConnect,
-    required this.onConnectManual,
-    required this.onConnectDemo,
-  });
-
-  final CameraConnection conn;
-  final bool showManualIp;
-  final TextEditingController manualIpController;
-  final VoidCallback onToggleManualIp;
-  final VoidCallback onConnect;
-  final VoidCallback onConnectManual;
-  final VoidCallback onConnectDemo;
+class _CameraPlaceholder extends StatelessWidget {
+  const _CameraPlaceholder();
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        FilledButton.icon(
-          onPressed: onConnect,
-          icon: const Icon(Icons.link),
-          label: const Text('Connect to camera'),
-        ),
-        const SizedBox(height: 8),
-        OutlinedButton.icon(
-          onPressed: onConnectDemo,
-          icon: const Icon(Icons.science_outlined),
-          label: const Text('Demo Lumix S5'),
-        ),
-        const SizedBox(height: 16),
-        Text(
-          'Status: ${conn.statusText}',
-          style: theme.textTheme.bodyMedium,
-        ),
-        if (conn.errorText != null) ...[
-          const SizedBox(height: 8),
-          Text(
-            conn.errorText!,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.error,
-            ),
-          ),
-        ],
-        const SizedBox(height: 24),
-        Text(
-          'Make sure the camera is in WiFi → Smartphone mode and your '
-          'phone is joined to the LUMIX-… network.',
-          style: theme.textTheme.bodySmall?.copyWith(
-            color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
-          ),
-        ),
-        const SizedBox(height: 16),
-        TextButton.icon(
-          onPressed: onToggleManualIp,
-          icon: Icon(
-            showManualIp ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-            size: 18,
-          ),
-          label: Text(
-            showManualIp ? 'Hide manual IP' : 'Enter camera IP manually',
-          ),
-        ),
-        if (showManualIp) ...[
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: manualIpController,
-                  decoration: const InputDecoration(
-                    labelText: 'Camera IP',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                  keyboardType: TextInputType.url,
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(
-                onPressed: onConnectManual,
-                child: const Text('Connect'),
-              ),
-            ],
-          ),
-        ],
-      ],
-    );
-  }
-}
-
-class _ConnectingView extends StatelessWidget {
-  const _ConnectingView({required this.conn});
-  final CameraConnection conn;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            const SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                conn.statusText,
-                style: theme.textTheme.bodyMedium,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-        Text(
-          'Phase: ${_phaseLabel(conn.status)}',
-          style: theme.textTheme.bodySmall?.copyWith(
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Text(
+          'Connect a camera — tap the camera icon above.',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
           ),
         ),
-      ],
+      ),
     );
   }
-
-  String _phaseLabel(CameraStatus s) => switch (s) {
-        CameraStatus.discovering => 'discovering',
-        CameraStatus.registering => 'registering',
-        CameraStatus.loadingCaps => 'loading capabilities',
-        _ => '—',
-      };
 }
 
 class _ConnectedView extends StatefulWidget {
-  const _ConnectedView({required this.conn, required this.onDisconnect});
+  const _ConnectedView({required this.conn});
   final CameraConnection conn;
-  final VoidCallback onDisconnect;
 
   @override
   State<_ConnectedView> createState() => _ConnectedViewState();
@@ -416,12 +250,6 @@ class _ConnectedViewState extends State<_ConnectedView> {
               ),
             ),
             _BatteryIcon(battery: conn.cameraState?.battery),
-            const SizedBox(width: 4),
-            TextButton.icon(
-              onPressed: widget.onDisconnect,
-              icon: const Icon(Icons.link_off, size: 18),
-              label: const Text('Disconnect'),
-            ),
           ],
         ),
         const Divider(height: 24),
