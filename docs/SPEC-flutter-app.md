@@ -25,10 +25,6 @@ This spec covers **Phase 0 only**: prove we can talk to the gimbal and
 provide an interactive playground for protocol exploration. Later phases
 are sketched at the end.
 
-The original `SPEC.md` (patching the stock APK to extend the focal-length
-list) is preserved as a documented fallback if this project gets
-shelved.
-
 ## Hardware / software
 
 - Gimbal: Feiyu SCORP C2 (firmware version to record once readable).
@@ -2617,9 +2613,12 @@ path.
 
 #### Sign-off
 
-After PR 6, PR 7, PR 8 and PR 9 land and all on-hardware verification
-checkpoints above pass, Phase 2 is complete. Move to Phase 3 (protocol library
-extraction) or Phase 4 (panorama sequencer) — order optional.
+PR 6 (EV compensation), PR 7, PR 8 and PR 9 have all landed and
+their on-hardware verification checkpoints pass. The remaining
+Phase 2 piece — the PR 6 single-shot self-timer / capture-delay —
+is being re-specified separately. Once that ships, Phase 2 is
+complete; next is Phase 3 (protocol library extraction) or
+Phase 4 (panorama sequencer) — order optional.
 
 ### Out of scope (Phase 2)
 
@@ -2721,9 +2720,6 @@ becomes the active discovery winner.
   the S5D.
 - ✓ Phase 0 / Phase 1 gimbal behaviour unaffected by the
   Kotlin → Java migration.
-
-PR 4 and PR 5 remain TBD on hardware — live preview and controls +
-capture + polling respectively (post-swap, see Implementation steps).
 
 ### Phase 2 — known limitation: hardened-firmware auth wall (discovered post-PR-3)
 
@@ -2860,8 +2856,9 @@ The "PR 3.5 — auth handshake for hardened firmware" task is now
 **only** needed if/when we want the Sciens app to work on a
 device that has *not* been BT-paired via LUMIX Sync.
 
-PR 5 (controls + polling + mode hint + aperture sentinel) and PR 6
-(EV compensation + self-timer) remain TBD on hardware.
+PR 5 and PR 6's EV-compensation have since landed and verified on
+hardware. The PR 6 single-shot self-timer / capture-delay is the
+remaining Phase 2 piece — to be re-specified separately.
 
 ## Phase 3 — protocol library (outline only)
 
@@ -2899,8 +2896,9 @@ Math:
 ## Out of scope (entire project)
 
 - iOS / desktop / web targets.
-- Camera-side control (PTP/MTP, USB tether, Wi-Fi shutter, image
-  preview).
+- Camera-side control over PTP/MTP or USB tether — we use the
+  camera's WiFi remote-control interface (Phase 2) and the gimbal's
+  shutter cable.
 - Image stitching — done in PTGui / Hugin / Lightroom after capture.
 - Firmware updates to the gimbal.
 - Redistribution of any decompiled or derived code.
