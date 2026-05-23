@@ -9,8 +9,8 @@ import '../gimbal_visualization.dart';
 /// orientation status line and the pan/tilt/level controls. Uses
 /// AutomaticKeepAliveClientMixin so the visualization's smoothing
 /// state survives switching to the logs tab.
-class ControlsTab extends ConsumerStatefulWidget {
-  const ControlsTab({
+class GimbalTab extends ConsumerStatefulWidget {
+  const GimbalTab({
     super.key,
     required this.stepController,
     required this.onPanLeft,
@@ -28,10 +28,10 @@ class ControlsTab extends ConsumerStatefulWidget {
   final VoidCallback onLevel;
 
   @override
-  ConsumerState<ControlsTab> createState() => _ControlsTabState();
+  ConsumerState<GimbalTab> createState() => _GimbalTabState();
 }
 
-class _ControlsTabState extends ConsumerState<ControlsTab>
+class _GimbalTabState extends ConsumerState<GimbalTab>
     with AutomaticKeepAliveClientMixin {
   @override
   bool get wantKeepAlive => true;
@@ -40,6 +40,10 @@ class _ControlsTabState extends ConsumerState<ControlsTab>
   Widget build(BuildContext context) {
     super.build(context);
     final conn = ref.watch(gimbalConnectionProvider);
+
+    if (!conn.isConnected) {
+      return const _GimbalPlaceholder();
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -266,6 +270,27 @@ class _ControlsPanel extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _GimbalPlaceholder extends StatelessWidget {
+  const _GimbalPlaceholder();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Text(
+          'Connect a gimbal — tap the gimbal icon above.',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
+          ),
+        ),
       ),
     );
   }

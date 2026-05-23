@@ -7,7 +7,7 @@ import '../state/gimbal_connection.dart';
 import 'devices_panel.dart';
 import 'header.dart';
 import 'tabs/camera_tab.dart';
-import 'tabs/controls_tab.dart';
+import 'tabs/gimbal_tab.dart';
 import 'tabs/logs_tab.dart';
 
 /// Post-connect screen. Layout:
@@ -89,7 +89,7 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen>
               child: TabBarView(
                 controller: _tabController,
                 children: [
-                  ControlsTab(
+                  GimbalTab(
                     stepController: _stepController,
                     onPanLeft: () => _move(course: -_stepDeg),
                     onPanRight: () => _move(course: _stepDeg),
