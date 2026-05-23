@@ -22,7 +22,6 @@ class CameraSheet extends ConsumerStatefulWidget {
 class _CameraSheetState extends ConsumerState<CameraSheet> {
   final _manualIpController = TextEditingController(text: '192.168.54.1');
   bool _showManualIp = false;
-  CameraStatus? _lastStatus;
 
   @override
   void dispose() {
@@ -54,17 +53,6 @@ class _CameraSheetState extends ConsumerState<CameraSheet> {
   @override
   Widget build(BuildContext context) {
     final conn = ref.watch(cameraConnectionProvider);
-
-    // Belt-and-braces: if the status transitions to Connected for any
-    // reason (e.g. an external connect path), still auto-dismiss.
-    if (_lastStatus != CameraStatus.connected &&
-        conn.status == CameraStatus.connected) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) Navigator.of(context).maybePop();
-      });
-    }
-    _lastStatus = conn.status;
-
     final theme = Theme.of(context);
     final body = switch (conn.status) {
       CameraStatus.disconnected || CameraStatus.error => _DisconnectedBody(
