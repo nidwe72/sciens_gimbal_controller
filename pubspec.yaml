@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_blue_plus: ^2.3.2
   flutter_riverpod: ^3.3.1
+  audioplayers: ^6.0.0
   flutter_svg: ^2.0.10
   http: ^1.2.0
   permission_handler: ^12.0.1
@@ -67,9 +68,12 @@ flutter:
 
   # Demo Lumix S5 — the synthetic camera image (PR 9).
   # Branding — the sciens.svg mark used in the app header (PR 11 follow-up).
+  # PR 10 — capture-delay SFX + the iris glyph for the firing-phase overlay.
   assets:
     - assets/demo/
     - assets/branding/
+    - assets/sounds/
+    - assets/icons/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

@@ -2816,14 +2816,11 @@ demo transports.
   - `muted = true`: 0 beeps, 0 shutter, capture still fires at T = 0.
   - `AppLifecycleState.paused` mid-countdown: countdown aborts;
     `capture()` not called; `overlayActive` flips false.
-- `test/capture_sounds_test.dart` (light) — `NullCaptureSounds` is a
-  no-op; the real `SoundpoolCaptureSounds` honours `muted` without
-  invoking the platform (mock the `Soundpool` boundary).
-- `test/capture_overlay_test.dart` (light widget test) — the overlay
-  appears when `overlayActive` is `true`; the centre renders the
-  ring + seconds during the countdown and the iris during firing;
-  the Cancel text button is visible during the countdown and hidden
-  during firing; tapping Cancel invokes `cancelCountdown()`.
+- `test/capture_sounds_test.dart` (light) — confirms
+  `NullCaptureSounds` is a no-op. The production implementation
+  (now `AudioPlayersCaptureSounds`, see "As built" below) hits real
+  platform audio and is covered by on-device verification rather
+  than a unit test.
 
 **Verifies on hardware (S5D)** — assuming the BT-paired Android
 phone per the PR 4 note:
@@ -2851,6 +2848,84 @@ phone per the PR 4 note:
 **Verifies in demo mode.** Same checks against the Demo Lumix S5 —
 capture delay and sounds behave identically, since both layer above
 the transport.
+
+**As built — final shipped form.** The implementation diverged from
+the plan above in several places after on-device iteration. The
+shipped state:
+
+- **UI layout (the biggest visible change).** The "Capture options"
+  block specced as a single section above the Capture button got
+  split into two rows that bracket the rest of the camera tab:
+  - **Top of the connected view** — the **Capture** button sits
+    directly under the camera header / divider.
+  - **Bottom of the connected view (just above the Mute row)** — a
+    single line `[☐ Delay] [ 3 ] s` row with a `Delay` checkbox
+    followed by the seconds input. The checkbox **gates** whether
+    the typed seconds apply (default off → no delay regardless of
+    field value); the field is greyed when the checkbox is off and
+    starts at `3` so once toggled on the user has a sensible
+    value.
+  - **Very bottom of the connected view** — a single `Mute`
+    checkbox row.
+- **delay = 0 path no longer skips the overlay.** The iris glyph
+  still flashes briefly for the duration of the camera-firing
+  window, with a **500 ms minimum-display floor** so fast shutters
+  register. (The original plan called for "no overlay on delay = 0";
+  in practice the brief iris flash makes every capture both
+  audibly and visually confirmed.)
+- **500 ms minimum iris display** for the delay > 0 path too — so
+  even a fast shutter at T = 0 doesn't blink the iris on/off
+  imperceptibly.
+- **Iris glyph behaviour.** Solid `colorScheme.primary` fill. **No
+  alpha pulse and no gray ↔ primary cycle** — the in-between
+  values blended with the dark scrim and made the iris read as a
+  lighter green than the header. Rendered at **255 dp** (~50 %
+  larger than the 140 dp countdown ring) so the firing phase
+  visually dominates the countdown phase.
+- **Iris source.** The `mdi-camera-iris` glyph (6-blade aperture,
+  Material Design Icons). Roughly 83 % viewBox fill, hence the
+  bump to 255 dp to match the ring's apparent diameter.
+- **Countdown ring colour.** Uses `colorScheme.primary` (theme
+  green) — not the original gray — so the ring + iris share one
+  brand colour throughout the overlay.
+- **Brand colour.** Theme seed changed from the dark blue-gray
+  `#263238` to a green `#2E7D32`, so the capture-active visuals
+  pop on the dark scrim. To keep the rest of the tab content
+  pure white (and avoid M3's default tonal-surface tinting),
+  `ColorScheme.surface*` and `surfaceTint` are overridden to
+  `Colors.white` / `Colors.transparent` in `main.dart`.
+- **Audio package — `audioplayers ^6.0.0`** instead of `soundpool`.
+  Soundpool 2.4.1 still references Flutter's deprecated
+  embedding-v1 `Registrar` API and won't compile against current
+  Flutter; `audioplayers` is actively maintained and supports
+  configuring an Android audio context with `usageType: media` +
+  `contentType: music`, so the SFX route through `STREAM_MUSIC` and
+  bypass the device's ringer / silent mode (same end behaviour as
+  the original spec).
+- **Shutter clip.** A single MP3 sample
+  (`assets/sounds/shutter.mp3`, ~1 s, SoundReality via Pixabay) is
+  played from start on each capture. The original plan called for
+  separate `shutter_open` + `shutter_close` clips with the close
+  click scheduled by the current shutter-speed wire value; on
+  audition a single full-envelope clip reads more naturally on
+  common exposure speeds, and a single clip is simpler.
+- **Beep clip.** Still synthesized — a 100 ms 880 Hz sine wave
+  from `sox`, as planned (`assets/sounds/beep.ogg`).
+- **Overlay reach.** The PR 11 follow-up that landed before PR 10
+  moved the device icons into the app header and the device
+  selector into a bottom `NavigationBar`. The capture overlay
+  scrims only the camera-tab content area, so the header (with
+  brand mark + device icons) and the bottom `NavigationBar` stay
+  visible during a countdown.
+- **Dropped tests.** The `test/capture_overlay_test.dart` widget
+  test the original plan called for was **not implemented** — its
+  assertions are visual and effectively duplicate on-device
+  verification; low signal-to-effort.
+
+Tests landed: six `FakeAsync` `captureWithDelay` cases on
+`test/camera_connection_test.dart` covering the cadence
+(delay = 0 / 1 / 5), Cancel, Mute, and `AppLifecycleState.paused`
+paths.
 
 #### PR 11 — Devices panel & per-device connect
 

@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'camera_transport.dart';
+import 'capture_sounds.dart';
 import 'demo_lumix_camera.dart';
 import 'jpeg_decoder.dart';
 import 'lumix_camera.dart';
@@ -31,14 +33,23 @@ enum CameraStatus {
 class CameraConnection extends ChangeNotifier {
   CameraConnection({
     CameraTransport Function()? cameraFactory,
+    CaptureSounds Function()? captureSoundsFactory,
     Duration pollInterval = const Duration(seconds: 1),
   })  : _cameraFactory = cameraFactory ?? LumixCamera.new,
+        _captureSoundsFactory =
+            captureSoundsFactory ?? AudioPlayersCaptureSounds.new,
         _pollInterval = pollInterval;
 
   /// Builds the transport for each connect attempt. Injectable so
   /// `camera_connection_test.dart` can supply a `LumixCamera` wired to
   /// a mock `http.Client`.
   final CameraTransport Function() _cameraFactory;
+
+  /// Builds the capture-SFX instance lazily on first
+  /// `captureWithDelay` call. Injectable so tests can supply a
+  /// counting fake instead of the platform-bound soundpool impl.
+  final CaptureSounds Function() _captureSoundsFactory;
+  CaptureSounds? _sounds;
 
   /// Gap between poll cycles — overridable so tests run fast.
   final Duration _pollInterval;
@@ -76,6 +87,16 @@ class CameraConnection extends ChangeNotifier {
   final _capturedImage = ValueNotifier<ui.Image?>(null);
   bool _fetchInProgress = false;
 
+  // Capture-delay state (PR 10).
+  final ValueNotifier<int?> _countdownSecondsLeft = ValueNotifier(null);
+  final ValueNotifier<bool> _overlayActive = ValueNotifier(false);
+  final ValueNotifier<bool> _muted = ValueNotifier(false);
+  int? _initialCountdownSeconds;
+  Timer? _countdownTimer;
+  bool _countdownCancelled = false;
+  Completer<String?>? _countdownCompleter;
+  _LifecycleObserver? _lifecycleObserver;
+
   CameraStatus get status => _status;
   String get statusText => _statusText;
   String? get errorText => _errorText;
@@ -102,6 +123,31 @@ class CameraConnection extends ChangeNotifier {
       _status == CameraStatus.discovering ||
       _status == CameraStatus.registering ||
       _status == CameraStatus.loadingCaps;
+
+  /// Running integer seconds during a `captureWithDelay` countdown
+  /// phase; `null` once the firing phase starts or when no capture
+  /// is active. Drives the centred number of the capture-delay
+  /// overlay's countdown ring.
+  ValueListenable<int?> get countdownSecondsLeft => _countdownSecondsLeft;
+
+  /// True from the moment a `captureWithDelay(seconds > 0)` begins
+  /// until that capture completes (success, error, cancel, or
+  /// app-paused abort). The UI binds the capture-delay overlay's
+  /// visibility to this. For `captureWithDelay(0)` this stays
+  /// `false` throughout.
+  ValueListenable<bool> get overlayActive => _overlayActive;
+
+  /// Mute toggle for the capture SFX (shutter + countdown beeps).
+  /// Default `false` (sounds play). The camera still fires when
+  /// muted; this gates audio only.
+  ValueNotifier<bool> get muted => _muted;
+
+  /// The N that the current `captureWithDelay(N)` call started
+  /// with. Used by the capture-delay overlay to compute the
+  /// countdown ring's drain progress
+  /// (`countdownSecondsLeft / initialCountdownSeconds`). `null`
+  /// when no countdown is active.
+  int? get initialCountdownSeconds => _initialCountdownSeconds;
 
   /// IP we ended up talking to (real or manual). Useful for the UI's
   /// connection-summary line.
@@ -424,6 +470,168 @@ class CameraConnection extends ChangeNotifier {
     }
   }
 
+  /// Captures with an optional software-driven delay (PR 10). With
+  /// [seconds] = 0 the immediate-fire path runs (no overlay, just a
+  /// shutter sound + the existing [capture] call). With [seconds] > 0
+  /// it drives a Nikon-style countdown via [_ensureSounds]:
+  ///
+  /// - **Slow phase** — one beep at the start of each remaining
+  ///   second while `seconds_remaining >= 3`.
+  /// - **Fast phase** — one beep every 0.5 s during the final 2 s
+  ///   (T = 2.0, 1.5, 1.0, 0.5).
+  /// - At T = 0 the shutter sound plays and the underlying
+  ///   [capture] call fires.
+  ///
+  /// Drives [countdownSecondsLeft] (the integer displayed in the
+  /// overlay) and [overlayActive] (the visibility of the
+  /// capture-delay overlay). [cancelCountdown] aborts a countdown
+  /// in progress. Returns null on capture success, or a short error
+  /// detail (the string `'cancelled'` if the user cancelled).
+  Future<String?> captureWithDelay(int seconds) async {
+    if (seconds < 0) seconds = 0;
+
+    if (seconds == 0) {
+      // Immediate path — no countdown phase, but still flip the
+      // overlay on so the iris glyph flashes during the actual
+      // camera-firing window. The shutter sounds (open + close
+      // bracketing the exposure) also play. A 500 ms minimum-display
+      // floor keeps the iris visible long enough to register even
+      // when the body fires faster.
+      _overlayActive.value = true;
+      if (!_muted.value) unawaited(_ensureSounds().playShutter());
+      try {
+        final minDisplay =
+            Future<void>.delayed(const Duration(milliseconds: 500));
+        final err = await capture();
+        await minDisplay;
+        return err;
+      } finally {
+        _overlayActive.value = false;
+      }
+    }
+
+    if (_countdownTimer != null) {
+      return 'capture-delay countdown already in progress';
+    }
+
+    _registerLifecycleObserver();
+    _overlayActive.value = true;
+    _countdownSecondsLeft.value = seconds;
+    _initialCountdownSeconds = seconds;
+    _countdownCancelled = false;
+
+    final sounds = _ensureSounds();
+
+    // Initial beep at countdown start (T = N). For N >= 3 this is
+    // the first slow beep; for N = 1 or 2 it's the first fast beep
+    // (T = 1.0 / T = 2.0). Either way the user hears the start.
+    if (!_muted.value) unawaited(sounds.playBeep());
+
+    final completer = Completer<String?>();
+    _countdownCompleter = completer;
+    int currentTick = 0;
+
+    _countdownTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (t) async {
+        if (_countdownCancelled) {
+          t.cancel();
+          _countdownTimer = null;
+          if (!completer.isCompleted) completer.complete('cancelled');
+          return;
+        }
+
+        currentTick++;
+        final remaining = seconds - currentTick * 0.5;
+
+        if (remaining <= 0) {
+          // Fire phase. Cancel the timer first, then play the
+          // shutter sounds (open + close bracketing the exposure)
+          // and invoke the underlying capture. The 500 ms
+          // minimum-display floor keeps the iris visible long enough
+          // to register even when the body fires faster.
+          t.cancel();
+          _countdownTimer = null;
+          _countdownSecondsLeft.value = null;
+          if (!_muted.value) unawaited(sounds.playShutter());
+          final minDisplay =
+              Future<void>.delayed(const Duration(milliseconds: 500));
+          final err = await capture();
+          await minDisplay;
+          if (!completer.isCompleted) completer.complete(err);
+          return;
+        }
+
+        // Display update — only changes on integer-second boundaries.
+        if (remaining == remaining.truncateToDouble()) {
+          _countdownSecondsLeft.value = remaining.toInt();
+        }
+
+        // Beep cadence:
+        //   slow phase — at integer seconds while remaining >= 3
+        //   fast phase — at T = 2.0, 1.5, 1.0, 0.5
+        if (remaining == remaining.truncateToDouble() && remaining >= 3) {
+          if (!_muted.value) unawaited(sounds.playBeep());
+        } else if (remaining == 2.0 ||
+            remaining == 1.5 ||
+            remaining == 1.0 ||
+            remaining == 0.5) {
+          if (!_muted.value) unawaited(sounds.playBeep());
+        }
+      },
+    );
+
+    try {
+      return await completer.future;
+    } finally {
+      _overlayActive.value = false;
+      _countdownSecondsLeft.value = null;
+      _initialCountdownSeconds = null;
+      _countdownTimer?.cancel();
+      _countdownTimer = null;
+      _countdownCompleter = null;
+      _unregisterLifecycleObserver();
+    }
+  }
+
+  /// Aborts a [captureWithDelay] countdown in progress. No effect
+  /// once the firing phase has started — an in-flight camera shot
+  /// can't be cancelled.
+  void cancelCountdown() {
+    if (_countdownTimer == null) return;
+    _countdownCancelled = true;
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+    // Resolve the awaiting captureWithDelay future directly so its
+    // finally-block runs immediately (dismisses the overlay, clears
+    // countdown state). Without this the timer-cancelled callback
+    // would never get a chance to fire, and the await would hang.
+    final completer = _countdownCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete('cancelled');
+    }
+  }
+
+  CaptureSounds _ensureSounds() => _sounds ??= _captureSoundsFactory();
+
+  void _registerLifecycleObserver() {
+    if (_lifecycleObserver != null) return;
+    final observer = _LifecycleObserver(_onLifecyclePaused);
+    _lifecycleObserver = observer;
+    WidgetsBinding.instance.addObserver(observer);
+  }
+
+  void _unregisterLifecycleObserver() {
+    final observer = _lifecycleObserver;
+    if (observer == null) return;
+    _lifecycleObserver = null;
+    WidgetsBinding.instance.removeObserver(observer);
+  }
+
+  void _onLifecyclePaused() {
+    cancelCountdown();
+  }
+
   /// Fetch the most-recent captured JPEG (medium size) and publish it
   /// via [capturedImage]; also stash the full-res URL for
   /// [fetchFullImage]. Called after a successful capture. Best-effort
@@ -655,7 +863,29 @@ class CameraConnection extends ChangeNotifier {
     _capturedImage.value?.dispose();
     _capturedImage.dispose();
     _camera?.disconnect(streaming: _previewActive);
+    // PR 10 capture-delay teardown.
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+    _unregisterLifecycleObserver();
+    _sounds?.dispose();
+    _sounds = null;
+    _countdownSecondsLeft.dispose();
+    _overlayActive.dispose();
+    _muted.dispose();
     super.dispose();
+  }
+}
+
+/// Forwards Android app-lifecycle transitions to a single callback.
+/// Used by [CameraConnection] to abort an in-progress capture-delay
+/// countdown when the app is backgrounded (`AppLifecycleState.paused`).
+class _LifecycleObserver extends WidgetsBindingObserver {
+  _LifecycleObserver(this._onPaused);
+  final VoidCallback _onPaused;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) _onPaused();
   }
 }
 

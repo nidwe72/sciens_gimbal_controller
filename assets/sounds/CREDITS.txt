@@ -1,0 +1,14 @@
+Sciens Gimbal Controller — capture SFX
+========================================
+
+beep.ogg
+  Synthesized — single 880 Hz sine wave, 100 ms, fast linear fade-out.
+  Generated locally with `sox`. No third-party license attached.
+
+shutter.mp3
+  External camera-shutter sample. Original filename:
+  `soundreality-camera-shutter-171782.mp3` (renamed to keep the
+  in-code path stable). Original author / license: SoundReality —
+  fill in the precise attribution + URL here before shipping.
+  Played from the start on each capture (delay = 0 immediately,
+  delay > 0 at T = 0).

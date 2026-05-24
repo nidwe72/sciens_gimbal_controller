@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../camera/camera_connection.dart';
 import '../../camera/lumix_protocol.dart';
@@ -88,7 +90,8 @@ class _CameraTabState extends ConsumerState<CameraTab>
     super.build(context);
     final isDemo = ref.watch(
         cameraConnectionProvider.select((c) => c.isDemo));
-    return DefaultTabController(
+    final conn = ref.read(cameraConnectionProvider);
+    final tabsBody = DefaultTabController(
       length: isDemo ? 3 : 2,
       child: Column(
         children: [
@@ -110,6 +113,21 @@ class _CameraTabState extends ConsumerState<CameraTab>
           ),
         ],
       ),
+    );
+    // PR 10 — capture-delay overlay rendered as a Stack sibling so it
+    // covers the entire camera tab body (header + bottom NavigationBar
+    // remain visible). Only inserted while overlayActive is true.
+    return ValueListenableBuilder<bool>(
+      valueListenable: conn.overlayActive,
+      builder: (context, overlayActive, _) {
+        return Stack(
+          children: [
+            tabsBody,
+            if (overlayActive)
+              Positioned.fill(child: _CaptureOverlay(conn: conn)),
+          ],
+        );
+      },
     );
   }
 }
@@ -187,6 +205,19 @@ class _ConnectedView extends StatefulWidget {
 class _ConnectedViewState extends State<_ConnectedView> {
   bool _previewToggle = false;
   bool _toggleBusy = false;
+  // PR 10 — capture-delay state. The `Delay` checkbox gates whether
+  // the typed seconds apply (default off → no delay). The field
+  // starts at '3' so the user has a sensible value once they toggle
+  // it on.
+  final _delayController = TextEditingController(text: '3');
+  final ValueNotifier<bool> _delayEnabled = ValueNotifier<bool>(false);
+
+  @override
+  void dispose() {
+    _delayController.dispose();
+    _delayEnabled.dispose();
+    super.dispose();
+  }
 
   Future<void> _onTogglePreview(bool value) async {
     if (_toggleBusy) return;
@@ -253,6 +284,13 @@ class _ConnectedViewState extends State<_ConnectedView> {
           ],
         ),
         const Divider(height: 24),
+        _CaptureButton(
+          conn: conn,
+          shutterLabel: shutterLabel,
+          delayController: _delayController,
+          delayEnabled: _delayEnabled,
+        ),
+        const Divider(height: 24),
         // PR 4: live-preview toggle + preview pane.
         SwitchListTile(
           value: _previewToggle,
@@ -306,8 +344,10 @@ class _ConnectedViewState extends State<_ConnectedView> {
           editable: _evEditable(mode) && exposureValues.isNotEmpty,
           onApply: (w) => conn.applySetting('exposure', w),
         ),
-        const SizedBox(height: 20),
-        _CaptureButton(conn: conn, shutterLabel: shutterLabel),
+        const SizedBox(height: 24),
+        _DelayRow(enabled: _delayEnabled, controller: _delayController),
+        const SizedBox(height: 8),
+        _MuteRow(conn: conn),
       ],
     );
   }
@@ -603,10 +643,17 @@ class _ApertureSentinelRow extends StatelessWidget {
 /// shot — reliable for fast and long exposures alike) or when a
 /// shutter-derived timeout elapses as a backstop.
 class _CaptureButton extends StatefulWidget {
-  const _CaptureButton({required this.conn, required this.shutterLabel});
+  const _CaptureButton({
+    required this.conn,
+    required this.shutterLabel,
+    required this.delayController,
+    required this.delayEnabled,
+  });
 
   final CameraConnection conn;
   final String? shutterLabel;
+  final TextEditingController delayController;
+  final ValueListenable<bool> delayEnabled;
 
   @override
   State<_CaptureButton> createState() => _CaptureButtonState();
@@ -642,7 +689,15 @@ class _CaptureButtonState extends State<_CaptureButton> {
     }
   }
 
+  int _readDelay() {
+    if (!widget.delayEnabled.value) return 0;
+    final raw = widget.delayController.text.trim();
+    if (raw.isEmpty) return 0;
+    return int.tryParse(raw) ?? 0;
+  }
+
   Future<void> _onTap() async {
+    final delay = _readDelay();
     setState(() {
       _capturing = true;
       _capacityAtTap = widget.conn.cameraState?.remainCapacity;
@@ -650,14 +705,42 @@ class _CaptureButtonState extends State<_CaptureButton> {
     });
     _messageTimer?.cancel();
     _timeoutTimer?.cancel();
-    _timeoutTimer = Timer(
-      optimisticCaptureTimeout(widget.shutterLabel ?? ''),
-      () => _finish('Capture may not have completed — check camera.'),
-    );
-    final error = await widget.conn.capture();
+    // The completion timeout is for the actual firing window — start
+    // it once the underlying shutter call lands, not at tap (a long
+    // delay would otherwise expire before the camera ever fires).
+    final completionTimeout =
+        optimisticCaptureTimeout(widget.shutterLabel ?? '');
+    if (delay == 0) {
+      _timeoutTimer = Timer(
+        completionTimeout,
+        () => _finish('Capture may not have completed — check camera.'),
+      );
+    }
+    final error = await widget.conn.captureWithDelay(delay);
     if (!mounted) return;
+    if (delay > 0) {
+      // For delayed captures, start the completion timeout now that
+      // the firing has finished. (Or, if cancelled, never start it.)
+      if (error != 'cancelled') {
+        _timeoutTimer = Timer(
+          completionTimeout,
+          () => _finish('Capture may not have completed — check camera.'),
+        );
+      }
+    }
     if (error != null) {
-      _finish('Capture failed — $error');
+      if (error == 'cancelled') {
+        // User-cancelled: just restore the idle state, no error UI,
+        // no post-capture fetch.
+        _timeoutTimer?.cancel();
+        _timeoutTimer = null;
+        setState(() {
+          _capturing = false;
+          _message = null;
+        });
+      } else {
+        _finish('Capture failed — $error');
+      }
     }
   }
 
@@ -689,13 +772,7 @@ class _CaptureButtonState extends State<_CaptureButton> {
         FilledButton(
           onPressed:
               (_capturing || widget.conn.fetchInProgress) ? null : _onTap,
-          child: (_capturing || widget.conn.fetchInProgress)
-              ? const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Text('Capture'),
+          child: const Text('Capture'),
         ),
         if (_message != null) ...[
           const SizedBox(height: 4),
@@ -992,6 +1069,196 @@ class _VirtualLumixTabState extends ConsumerState<_VirtualLumixTab> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// PR 10 — capture options row (delay text field + Mute checkbox).
+/// Sits above the Capture button inside [_ConnectedView].
+/// PR 10 — single-line row below the Capture button: a Delay
+/// checkbox followed by the seconds input. The checkbox gates
+/// whether the typed seconds apply; the field is greyed when the
+/// checkbox is off.
+class _DelayRow extends StatelessWidget {
+  const _DelayRow({required this.enabled, required this.controller});
+
+  final ValueNotifier<bool> enabled;
+  final TextEditingController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: enabled,
+      builder: (context, isEnabled, _) {
+        return Row(
+          children: [
+            Checkbox(
+              value: isEnabled,
+              onChanged: (v) => enabled.value = v ?? false,
+            ),
+            const Text('Delay'),
+            const SizedBox(width: 16),
+            SizedBox(
+              width: 96,
+              child: TextField(
+                controller: controller,
+                enabled: isEnabled,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: false,
+                  signed: false,
+                ),
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                  suffixText: 's',
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// PR 10 — Mute checkbox, rendered at the very bottom of the
+/// connected camera view. Gates audio output (shutter + countdown
+/// beeps) without affecting the camera firing itself.
+class _MuteRow extends StatelessWidget {
+  const _MuteRow({required this.conn});
+  final CameraConnection conn;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: conn.muted,
+      builder: (context, muted, _) => Row(
+        children: [
+          Checkbox(
+            value: muted,
+            onChanged: (v) => conn.muted.value = v ?? false,
+          ),
+          const Text('Mute'),
+        ],
+      ),
+    );
+  }
+}
+
+/// PR 10 — dominant centred modal overlay shown for the duration of
+/// a `captureWithDelay(seconds > 0)` call. Inserted at the camera
+/// tab's root as a Stack sibling so it covers the tab body (but not
+/// the app header or the bottom navigation bar). For delay = 0 the
+/// overlay never appears.
+///
+/// - **Countdown phase**: a thick gray ring that drains full → empty
+///   over the N seconds, with the seconds-remaining integer in the
+///   centre, and a Cancel text button below.
+/// - **Firing phase** (countdownSecondsLeft has gone null but
+///   overlayActive is still true): an iris-glyph SVG blinking
+///   between `colorScheme.outline` (gray) and `colorScheme.primary`
+///   at ~1 Hz. Cancel is hidden.
+class _CaptureOverlay extends StatefulWidget {
+  const _CaptureOverlay({required this.conn});
+  final CameraConnection conn;
+
+  @override
+  State<_CaptureOverlay> createState() => _CaptureOverlayState();
+}
+
+class _CaptureOverlayState extends State<_CaptureOverlay> {
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ColoredBox(
+      color: Colors.black.withValues(alpha: 0.5),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {}, // absorbs taps so the underlying tab body
+                       // can't be driven during the countdown / fire.
+        child: Center(
+          child: ValueListenableBuilder<int?>(
+            valueListenable: widget.conn.countdownSecondsLeft,
+            builder: (context, secondsLeft, _) {
+              final initial = widget.conn.initialCountdownSeconds ?? 1;
+              if (secondsLeft == null) {
+                // Firing phase — solid iris in the app's primary
+                // green. (No alpha pulse — that was making the iris
+                // read as a lighter green than the header.)
+                return const _IrisGlyph();
+              }
+              // Countdown phase — drain ring + number + Cancel.
+              final progress = initial > 0
+                  ? (secondsLeft / initial).clamp(0.0, 1.0)
+                  : 0.0;
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 140,
+                    height: 140,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        SizedBox.expand(
+                          child: CircularProgressIndicator(
+                            value: progress,
+                            strokeWidth: 8,
+                            backgroundColor:
+                                Colors.white.withValues(alpha: 0.15),
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              theme.colorScheme.primary,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          '$secondsLeft',
+                          style: theme.textTheme.displayMedium?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextButton(
+                    onPressed: widget.conn.cancelCountdown,
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.white,
+                    ),
+                    child: const Text('Cancel'),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _IrisGlyph extends StatelessWidget {
+  const _IrisGlyph();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    // Solid theme-primary green — same colour as the app header.
+    // (Earlier versions pulsed alpha; the in-between values blended
+    // with the scrim and made the iris read as a lighter green.)
+    // Rendered ~50% larger than the 140 dp countdown ring so the
+    // firing phase visually pops over the countdown phase.
+    return SvgPicture.asset(
+      'assets/icons/iris.svg',
+      width: 255,
+      height: 255,
+      colorFilter: ColorFilter.mode(
+        theme.colorScheme.primary,
+        BlendMode.srcIn,
       ),
     );
   }
