@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../camera/camera_connection.dart';
 import '../camera/camera_diagnostics.dart';
 import '../state/gimbal_connection.dart';
+import '../state/panorama_controller.dart';
 import 'header.dart';
 import 'tabs/camera_tab.dart';
 import 'tabs/gimbal_tab.dart';
@@ -106,8 +107,11 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen> {
         ),
         bottomNavigationBar: NavigationBar(
           selectedIndex: _selectedIndex,
-          onDestinationSelected: (i) =>
-              setState(() => _selectedIndex = i),
+          // Block top-level tab switching while a panorama run is active.
+          onDestinationSelected: ref
+                  .watch(panoramaControllerProvider.select((c) => c.running))
+              ? null
+              : (i) => setState(() => _selectedIndex = i),
           destinations: const [
             NavigationDestination(
               icon: Icon(Icons.camera_alt_outlined),

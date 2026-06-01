@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../state/gimbal_connection.dart';
+import '../../state/panorama_controller.dart';
 import '../gimbal_visualization.dart';
 import 'logs_tab.dart';
 
@@ -41,6 +42,8 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
   Widget build(BuildContext context) {
     super.build(context);
     final conn = ref.watch(gimbalConnectionProvider);
+    final panoRunning =
+        ref.watch(panoramaControllerProvider.select((c) => c.running));
 
     return DefaultTabController(
       length: 2,
@@ -55,7 +58,7 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
           Expanded(
             child: TabBarView(
               children: [
-                _gimbalBody(conn),
+                _gimbalBody(conn, panoRunning),
                 const LogsTab(),
               ],
             ),
@@ -65,7 +68,7 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
     );
   }
 
-  Widget _gimbalBody(GimbalConnection conn) {
+  Widget _gimbalBody(GimbalConnection conn, bool panoRunning) {
     if (!conn.isConnected) {
       return const _GimbalPlaceholder();
     }
@@ -80,7 +83,7 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
         const Divider(height: 1),
         _ControlsPanel(
           stepController: widget.stepController,
-          enabled: conn.isConnected && !conn.moving,
+          enabled: conn.isConnected && !conn.moving && !panoRunning,
           moving: conn.moving,
           onPanLeft: widget.onPanLeft,
           onPanRight: widget.onPanRight,

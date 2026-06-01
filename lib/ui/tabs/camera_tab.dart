@@ -9,7 +9,9 @@ import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../camera/camera_connection.dart';
 import '../../camera/lumix_protocol.dart';
+import '../../state/panorama_controller.dart';
 import 'camera_diagnostics_view.dart';
+import 'pano_tab.dart';
 
 /// Shooting-mode hint — the dial position the user has set on the
 /// camera body. Pure client-side state: the Lumix protocol exposes no
@@ -91,21 +93,33 @@ class _CameraTabState extends ConsumerState<CameraTab>
     final isDemo = ref.watch(
         cameraConnectionProvider.select((c) => c.isDemo));
     final conn = ref.read(cameraConnectionProvider);
+    // Block sub-tab switching while a panorama run is active (the run
+    // lives in the Pano sub-tab; navigating away mid-run is disallowed).
+    final panoRunning =
+        ref.watch(panoramaControllerProvider.select((c) => c.running));
     final tabsBody = DefaultTabController(
-      length: isDemo ? 3 : 2,
+      length: isDemo ? 4 : 3,
       child: Column(
         children: [
-          TabBar(
-            tabs: [
-              const Tab(text: 'Capture'),
-              if (isDemo) const Tab(text: 'Virtual S5'),
-              const Tab(text: 'Debug/Diagnostics'),
-            ],
+          IgnorePointer(
+            ignoring: panoRunning,
+            child: TabBar(
+              tabs: [
+                const Tab(text: 'Capture'),
+                const Tab(text: 'Pano'),
+                if (isDemo) const Tab(text: 'Virtual S5'),
+                const Tab(text: 'Debug/Diagnostics'),
+              ],
+            ),
           ),
           Expanded(
             child: TabBarView(
+              physics: panoRunning
+                  ? const NeverScrollableScrollPhysics()
+                  : null,
               children: [
                 const _CameraControlsTab(),
+                const PanoTab(),
                 if (isDemo) const _VirtualLumixTab(),
                 const CameraDiagnosticsView(),
               ],
