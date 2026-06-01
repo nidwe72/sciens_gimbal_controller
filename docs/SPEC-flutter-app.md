@@ -3763,13 +3763,27 @@ grid and fire the shutter at each tile. Built **on top of Phase 3's
   no Flutter (`packages/feiyu_gimbal/` or a small `lib/panorama/`
   module — placement decided at impl time; it has no transport
   dependency either way).
-- **Demo-first (hard gate).** Tiles are captured on the **demo devices
-  first** — the full sequence must run end-to-end against the demo
-  gimbal + virtual Lumix S5 (PR 9) before pointing at real glass. This
-  requires the demo Lumix's bundled asset image to be **tiled in
-  memory**: each tile capture returns a *different* sub-region of the
-  asset so the on-screen contact sheet shows a real mosaic, not the
-  same frame N times.
+- **Demo-first (hard gate).** The full sequence must run end-to-end
+  against the demo gimbal + virtual Lumix S5 (PR 9) before pointing at
+  real glass.
+- **Placement — a 'Pano' sub-tab inside the Camera tab** (alongside
+  Capture / [Virtual S5] / Debug-Diagnostics in the existing nested
+  `TabBar` at `lib/ui/tabs/camera_tab.dart`). This **supersedes the
+  earlier "dedicated screen" decision**. Rationale: panorama capture
+  belongs conceptually with the camera, and the sub-tab scaffolding
+  already exists.
+- **Two focal inputs (Brenizer).** A *stitched-image focal* — the FOV
+  the finished panorama should cover, which sets the **total span** —
+  and a *taking-lens focal* — the lens actually mounted, which sets
+  **one tile's FOV** — plus overlap. This is exactly what the two-focal
+  grid math needs; the single-focal idea from the first sketch can't
+  yield a tile count on its own.
+- **First-sweep progress = coloured cells.** For the first
+  implementation the tile grid is a schematic of cells; as the run
+  proceeds each *captured* tile's cell is recoloured. No per-tile
+  thumbnail fetch and no demo-asset tiling yet — **this supersedes the
+  earlier per-tile thumbnail / contact-sheet decision** for the first
+  sweep (kept as a later enhancement; see "Deferred").
 
 ### Grid math (pure module)
 
@@ -3777,15 +3791,22 @@ Sensor model: full-frame 36×24 mm → half-extents 18 mm × 12 mm. *(The
 original outline used 17.5 mm half-width; impl uses the true 18 mm
 unless a measured value supersedes it.)*
 
-Inputs: `focalFrame` mm (composition lens, default 24), `focalCapture`
-mm (taking lens, default 90), `overlap` fraction 0–0.9 (default 0.30),
-`centreYaw`, `centrePitch` degrees (from Read Framing).
+Inputs: `focalStitch` mm (*stitched-image focal* — the FOV the finished
+panorama covers; sets total span), `focalTaking` mm (*taking-lens
+focal* — the mounted lens; sets one tile's FOV), `overlap` fraction
+0–0.9 (default 0.30), `centreYaw`, `centrePitch` degrees (the gimbal's
+current orientation, snapshotted when "Take panorama" is pressed).
+
+Slider ranges / defaults (confirmed 2026-06-01): taking-lens focal
+**50–150 mm**, default **50 mm**; stitched-image focal **24–100 mm**,
+default **24 mm**; with the constraint `focalStitch ≤ focalTaking`
+(otherwise the grid collapses to 1×1).
 
 ```
-H_span   = 2·atan(halfW / focalFrame)        // total horizontal extent to cover
-V_span   = 2·atan(halfH / focalFrame)        // total vertical extent
-tile_h   = 2·atan(halfW / focalCapture)      // one tile's horizontal FOV
-tile_v   = 2·atan(halfH / focalCapture)
+H_span   = 2·atan(halfW / focalStitch)       // total horizontal extent to cover
+V_span   = 2·atan(halfH / focalStitch)       // total vertical extent
+tile_h   = 2·atan(halfW / focalTaking)       // one tile's horizontal FOV
+tile_v   = 2·atan(halfH / focalTaking)
 step_h   = tile_h · (1 − overlap)            // centre-to-centre spacing
 step_v   = tile_v · (1 − overlap)
 n_cols   = ceil(H_span / step_h) + 1
@@ -3797,7 +3818,7 @@ Grid is **symmetric** around `(centreYaw, centrePitch)`: column `i`
 for rows. Output: a `List<TilePosition{yaw, pitch, row, col}>` plus
 summary `{nCols, nRows, totalShots, hSpanDeg, vSpanDeg, estDuration}`.
 
-Edge cases the module must handle: `focalCapture ≤ focalFrame` (tiles
+Edge cases the module must handle: `focalTaking ≤ focalStitch` (tiles
 wider than the span → 1×1 grid, not negative counts); `overlap` clamp;
 `focal ≤ 0` guard; very large grids (cap + warn — see risks).
 
@@ -3819,12 +3840,11 @@ issue the *delta from where we are*):
 4. **Settle delay** (let vibration die before exposure) — distinct from
    PR 10's *capture delay* (see interaction note).
 5. **Capture.** Fire *without* the PR 10 countdown/sound overlay per
-   tile (immediate path). Pull back a **thumbnail** per tile (not the
-   full LRG JPEG) and place it in an on-screen **contact sheet** at the
-   tile's grid position, so the user watches the mosaic fill in. The
-   full-resolution stills stay on the camera's SD card for later
-   stitching. (Thumbnail fetch must stay cheap enough not to dominate
-   the run — see risks.)
+   tile (immediate path). On a successful return, **recolour that
+   tile's cell** in the grid to mark it taken. First sweep pulls back
+   **no image** per tile — the full-resolution stills stay on the
+   camera's SD card for later stitching. (Per-tile thumbnails into the
+   cell are a later enhancement; see "Deferred".)
 6. **Inter-shot delay** before the next move.
 
 The sequencer tracks **commanded absolute** position, not measured, to
@@ -3832,25 +3852,37 @@ accumulate the grid; but each move's *delta* is recomputed from the
 session's **measured** current angle so closed-loop residual error
 doesn't compound across the grid.
 
-### UI — third surface
+### UI — the 'Pano' sub-tab
 
-A **dedicated panorama screen** (not a tab inside the playground),
-with:
+A fourth sub-tab **'Pano'** inside the Camera tab — the nested `TabBar`
+(`lib/ui/tabs/camera_tab.dart`) already hosts Capture / [Virtual S5] /
+Debug-Diagnostics. Its body holds:
 
-- **Read Framing** button → snapshots current `(yawDeg, pitchDeg)` as
-  the grid centre; shows the captured centre and a "re-read" affordance.
-- Frame-lens focal input (default 24 mm), capture-lens focal input
-  (default 90 mm), overlap slider (default 30 %).
-- **Live computed preview**: H/V span, `n_cols × n_rows`, total shots,
-  estimated duration — recomputed as inputs change.
-- **Start** (enabled only when both gimbal and camera are connected and
-  a centre has been read).
-- **Progress UI** during a run: current tile `k / total`, a grid
-  position indicator, elapsed/remaining estimate, and a **Cancel**
-  button.
-- **Abort on disconnect**: if either the gimbal or the camera drops
-  mid-run, stop immediately, surface why, leave the gimbal where it is
-  (no auto-return).
+- **Taking-lens focal** input (slider, 50–150 mm, default 50).
+- **Stitched-image focal** input (slider, 24–100 mm, default 24).
+- **Overlap** slider (0–90 %, default 30 %).
+- **Settle delay** input (seconds, default **3 s**) — the wait after
+  each gimbal movement stops, before the shutter fires (see "Settle
+  delay" below).
+- **Live tile grid**: a schematic of `n_cols × n_rows` cells, redrawn
+  whenever a focal or overlap value changes, with the computed **tile
+  count** shown. (Span / estimated-duration readouts are optional for
+  the first sweep.)
+- **"Take panorama"** button — snapshots the gimbal's current
+  orientation as the grid centre and starts the sequencer. Enabled only
+  when both gimbal and camera are connected.
+- **Cancel** button — stops a run in progress.
+
+During a run the same grid doubles as the progress view: each captured
+tile's cell is recoloured. No separate progress screen for the first
+sweep. **Abort on disconnect**: if either the gimbal or the camera
+drops mid-run, stop immediately, surface why, and leave the gimbal where
+it is (no auto-return).
+
+There is **no explicit "Read Framing" button** in the first sweep —
+"Take panorama" uses the current gimbal orientation as the centre. (A
+separate compose-then-confirm read-framing step can return later if
+useful.)
 
 ### Settle delay vs. PR 10 capture delay
 
@@ -3859,43 +3891,90 @@ Two independent delays, must not be conflated:
 - **PR 10 capture delay** — a user-facing self-timer with countdown UI
   + beeps, for single hand-off shots. **Not used per-tile** in a
   panorama (no countdown spam across dozens of tiles).
-- **Phase 4 settle delay** — a short, fixed (configurable) wait after
-  the gimbal stops and before the shutter, so mechanical settling
-  doesn't smear the frame. New Phase-4 setting, defaulting to a
-  conservative value tuned on hardware.
+- **Phase 4 settle delay** — a **user-facing field in the Pano sub-tab
+  (seconds, default 3 s)**: the wait after each gimbal movement stops
+  and before the shutter fires, so mechanical settling doesn't smear the
+  frame.
 
 ### Capture path reuse
 
 `CameraConnection.captureWithDelay(int)` returns `Future<String?>`
-(null = success). For panorama tiles we want the fire-now path
-**without** the PR 10 overlay/sound, and a **thumbnail** fetch rather
-than PR 8's full-LRG fetch+display into `capturedImage`. This likely
-needs a thin "capture + thumbnail" entry point on `CameraConnection`,
-decided at impl time. The thumbnail feeds the contact sheet; the full
-still is left on the SD card. Each tile checks the returned error
-string and applies the per-tile policy above (log + continue, 2°
-tolerance, no retry for now).
+(null = success). For panorama tiles the first sweep uses the fire-now
+path **without** the PR 10 overlay/sound and **without** any
+post-capture image fetch (neither PR 8's full-LRG fetch nor a
+thumbnail) — the cell is simply recoloured on a null return. This likely
+needs a thin "capture-only, no fetch" entry point on `CameraConnection`,
+decided at impl time. Each tile checks the returned error string and
+applies the per-tile policy above (log + continue, 2° tolerance, no
+retry for now).
+
+### Run lifecycle, preconditions & completion
+
+A *complete* run needs more than the per-tile loop:
+
+- **Where it lives.** The sequencer is a **riverpod-hosted controller**
+  (like `GimbalConnection` / `CameraConnection`), not Pano-sub-tab
+  widget state — so a run survives the user switching sub-tabs or to the
+  Gimbal top-tab, and the grid/progress rebinds on return.
+- **Preconditions to start.** Both gimbal and camera connected; camera
+  in **record mode** (not playback — `recMode`); grid at least 1×1.
+  "Take panorama" is disabled otherwise.
+- **Lock-out during a run.** Manual gimbal control (Gimbal-tab pan /
+  tilt / Level) and the Pano inputs (focals, overlap, settle delay) are
+  **disabled** while a run is active; only Cancel stays live. Prevents a
+  manual `moveByAngle` colliding with the sequencer (`moveByAngle` is a
+  no-op while already `_moving`, but the planned grid would desync).
+- **Live preview.** If the Capture sub-tab's MJPEG preview is running,
+  the sequencer **stops it for the duration** (preview stream +
+  keep-alive vs. rapid stills capture shouldn't compete); no need to
+  restore it afterward.
+- **Per-tile completion (decided).** `capture()` returns when the camera
+  *acknowledges* the command — **not** when the exposure and SD-write
+  finish. Moving the gimbal too soon smears a long exposure (likely with
+  stopped-down vintage glass). After firing, the sequencer **waits for
+  the camera's `sdAccess`/`isBusy` flag to go busy→idle** (with a fixed
+  minimum floor, in case the busy window is too brief to observe at the
+  poll rate) before the next move. Requires camera-state polling active
+  during the run.
+- **On completion / cancel / abort (decided).** On **clean completion**
+  the gimbal **returns to the captured centre**; **Cancel** stops after
+  the current tile and likewise returns to centre (the link is alive).
+  **Disconnect** mid-run aborts and leaves the gimbal where it is — a
+  dropped link can't be driven home.
 
 ### PR breakdown (later)
 
 - **PR 14 — Grid math module + tests.** Pure Dart, no UI, no transport.
   Full unit-test table across focal/overlap combinations and edge
   cases. No user-visible change yet.
-- **PR 15 — Panorama screen (inputs + computed preview).** UI binds to
-  PR 14's math; Read Framing snapshots centre. No motion, no capture.
+- **PR 15 — 'Pano' sub-tab (inputs + live tile grid).** Add the sub-tab
+  to the Camera `TabBar`; the two focal sliders + overlap drive PR 14's
+  math; the cell grid + tile count redraw live. No motion, no capture.
 - **PR 16 — Sequencer (motion + capture + progress + cancel + abort).**
-  The state machine on top of `GimbalSession.moveByAngle` and the
-  silent-capture path. Unit-tested against fake transport + demo
-  camera; verified end-to-end on demo, then on hardware.
+  A **riverpod-hosted `PanoramaController`** running the state machine on
+  top of `GimbalSession.moveByAngle` (needs PR 13's `MoveResult`) and a
+  new **capture-only, no-fetch** entry point on `CameraConnection`.
+  "Take panorama" snapshots centre and runs the serpentine grid with the
+  settle delay + per-tile exposure-completion wait; captured cells
+  recolour; manual gimbal control + Pano inputs lock out; live preview
+  stops for the duration; Cancel + abort-on-disconnect. Unit-tested
+  against fake transport + demo camera; verified end-to-end on demo,
+  then on hardware.
+
+Prerequisite: **PR 13** (the `GimbalSession` extraction + `MoveResult`
+return) lands before PR 16. PR 14 / PR 15 have no Phase-3 dependency and
+can proceed in parallel.
 
 ### Verification checkpoints (Phase 4)
 
 - [ ] Grid math unit tests: known focal/overlap inputs produce expected
       `n_cols`/`n_rows`/positions; symmetric around centre; degenerate
-      inputs (capture ≤ frame focal, overlap extremes) don't explode.
-- [ ] Demo end-to-end: connect demo gimbal + virtual Lumix → read
-      framing → Start → gimbal animates through the serpentine grid,
-      camera "fires" at each tile, progress advances, run reaches
+      inputs (taking ≤ stitched focal, overlap extremes) don't explode.
+- [ ] Live tile grid: changing either focal or overlap redraws the cell
+      grid and updates the tile count immediately.
+- [ ] Demo end-to-end: connect demo gimbal + virtual Lumix → press
+      **Take panorama** → gimbal animates through the serpentine grid,
+      camera "fires" at each tile, the tile's cell recolours, run reaches
       `done`.
 - [ ] Cancel mid-run stops promptly; no further moves or captures.
 - [ ] Disconnect mid-run (gimbal or camera) → `aborted` with a clear
@@ -3911,27 +3990,35 @@ tolerance, no retry for now).
 - **`moveByAngle` convergence reporting.** Phase 3 must land the
   `MoveResult` return first (PR 13); the sequencer's per-tile
   best-effort/abort policy depends on it.
-- **Thumbnail capture path.** PR 10's overlay and PR 8's full-LRG
-  fetch are both undesirable per-tile. Need a lean "capture +
-  thumbnail" entry point; confirm the S5 can fire and hand back a
-  thumbnail fast enough not to dominate the run.
-- **Demo asset tiling.** The virtual Lumix must serve a *different*
-  sub-region of its bundled asset per tile so the demo contact sheet is
-  a real mosaic; PR 9 today returns one fixed image. New demo-path work,
-  required by the demo-first gate.
-- **Yaw wrap / large pans.** Wide frame lens + narrow taking lens can
-  produce a big `n_cols`; cap total shots with a warning rather than
-  silently launching a 200-shot run. Also confirm `_angleDiff`
+- **Capture-only path.** PR 10's overlay and PR 8's full-LRG fetch are
+  both undesirable per-tile. Need a lean "capture-only, no fetch" entry
+  point; confirm the S5 can fire fast enough back-to-back to keep the
+  run brisk.
+- **Camera-state polling during a run.** The per-tile completion wait
+  relies on `sdAccess`/`isBusy`, so camera-state polling must run for the
+  duration even though the capture path fetches nothing. Confirm the poll
+  cadence reliably observes the busy window for fast shutter speeds (the
+  fixed minimum floor is the backstop when it doesn't).
+- **Yaw wrap / large pans.** A wide stitched-image focal + long taking
+  lens can produce a big `n_cols`; cap total shots with a warning rather
+  than silently launching a 200-shot run. Also confirm `_angleDiff`
   wrap-around behaves for yaw deltas crossing ±180°.
 - **Pitch limits & coast compensation.** `moveByAngle` pre-subtracts a
   1° pitch coast and skips sub-1° pitch moves — a fine grid with
   `step_v < 1°` would drop every pitch step. The sequencer must account
   for the coast-compensation floor (and the gimbal's mechanical pitch
   range) when validating a grid.
-- **Navigation to the dedicated panorama screen** from the post-PR-11
-  app shell — the entry point (header action vs. elsewhere) is a UX
-  decision for PR 15. The screen itself is dedicated (decided), not a
-  playground tab.
+### Deferred (later enhancements, not in the first sweep)
+
+- **Per-tile thumbnails into the grid cells** (a true contact sheet),
+  which would also require the demo Lumix to **tile its bundled asset
+  in memory** so the demo mosaic is real rather than the same frame N
+  times. Dropped from the first sweep in favour of coloured-cell
+  progress.
+- **Explicit Read-Framing / compose-then-confirm** step (centre is the
+  current orientation at "Take panorama" time for now).
+- **Span / estimated-duration readouts** in the Pano sub-tab (tile
+  count only, for now).
 
 ## Phase 5 — Hand-off to a separate image-viewer app (outline)
 
