@@ -12,5 +12,6 @@ library;
 export 'src/crc.dart';
 export 'src/frame_codec.dart';
 export 'src/commands.dart';
+export 'src/gimbal_session.dart';
 export 'src/transport/gimbal_transport.dart';
 export 'src/transport/demo_gimbal_transport.dart';
