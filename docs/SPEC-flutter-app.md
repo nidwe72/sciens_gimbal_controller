@@ -3689,12 +3689,22 @@ promise a working absolute goto. The contract is:
 
 - `Future<MoveResult> moveByAngle({double courseDeg, double pitchDeg})`
   — the existing closed-loop relative move, but it now **returns a
-  result** instead of only logging: final residual error per axis +
-  whether it converged within tolerance. (Today it returns `void`;
-  Phase 4 needs to know whether a tile move actually landed.)
+  result** instead of only logging. `MoveResult` carries an `outcome`
+  (`completed` / `stalled` / `timedOut` / `disconnected` / `skipped` /
+  `notReady` / `busy`) plus the **raw signed residual error per axis**.
+  **No `converged` flag and no baked-in tolerance** — the session reports
+  facts (outcome + residual numbers); each *caller* applies its own
+  policy. The panorama sequencer logs the residual as a diagnostic and
+  reacts only to hard outcomes; the manual gimbal tab ignores residuals
+  entirely. (Today it returns `void`.)
 - `Future<void> levelHome()` — unchanged closed-loop level-to-(0,0).
-- `Stream<GimbalStatus> status` — angles, follow-mode, `moving`,
-  errors.
+- `Stream<GimbalStatus> status` — angles, follow-mode, `moving`, and a
+  semantic **connection-phase enum** (`connecting` / `linking` /
+  `discovering` / `subscribing` / `connected` / `failed`); the adapter
+  maps the phase to the user-facing status string, plus a structured
+  log-event stream the adapter folds into `LogEntry`. The session uses
+  `package:clock` (`clock.now()`) for all time reads so motion is
+  testable under `fake_async`.
 - `gotoAngle(...)` — carried over but **kept marked speculative**;
   Phase 4 must not depend on it.
 
@@ -3705,13 +3715,16 @@ promise a working absolute goto. The contract is:
   `GimbalTransport` + `DemoGimbalTransport`. App imports flip from
   `lib/ble/...` to `package:feiyu_gimbal/...`. No behaviour change.
   Existing wire-layer tests move with the code and stay green.
-- **PR 13 — Extract `GimbalSession` (motion logic).** Move the motion
-  + orientation logic onto the framework-free session class with a
-  status `Stream`; reduce `GimbalConnection` to the adapter. Add
-  `MoveResult` return to `moveByAngle`. **New unit tests** drive
-  `GimbalSession` against `DemoGimbalTransport` (and/or a scripted
-  fake) — convergence, residual reporting, stall/timeout, no-op
-  guards — all with zero hardware and zero Flutter.
+- **PR 13 — Extract `GimbalSession` (motion logic).** ✅ *Built; tested
+  green + demo-verified 2026-06-01, real-SCORP-C2 motion-feel check still
+  pending.* Moved the motion + orientation logic onto the framework-free
+  `GimbalSession` (status `Stream`, `package:clock` for time);
+  `GimbalConnection` is now a thin `ChangeNotifier` adapter (phase→string
+  mapping + `LogEntry` model). `moveByAngle` returns `MoveResult`
+  (`outcome` + raw residuals, no `converged`). 8 unit tests drive it
+  against `DemoGimbalTransport` under `fake_async` — each `MoveOutcome`,
+  residual reporting, connect phases, log events — zero hardware, zero
+  Flutter.
 
 ### Verification checkpoints (Phase 3)
 
@@ -3794,7 +3807,7 @@ unless a measured value supersedes it.)*
 Inputs: `focalStitch` mm (*stitched-image focal* — the FOV the finished
 panorama covers; sets total span), `focalTaking` mm (*taking-lens
 focal* — the mounted lens; sets one tile's FOV), `overlap` fraction
-0–0.9 (default 0.30), `centreYaw`, `centrePitch` degrees (the gimbal's
+0–0.6 (default 0.30), `centreYaw`, `centrePitch` degrees (the gimbal's
 current orientation, snapshotted when "Take panorama" is pressed).
 
 Slider ranges / defaults (confirmed 2026-06-01): taking-lens focal
@@ -3815,12 +3828,32 @@ n_rows   = ceil(V_span / step_v) + 1
 
 Grid is **symmetric** around `(centreYaw, centrePitch)`: column `i`
 (0…n_cols−1) sits at `centreYaw + (i − (n_cols−1)/2)·step_h`, similarly
-for rows. Output: a `List<TilePosition{yaw, pitch, row, col}>` plus
-summary `{nCols, nRows, totalShots, hSpanDeg, vSpanDeg, estDuration}`.
+for rows. Tiles are emitted in **serpentine** order (odd rows reversed)
+so consecutive tiles are adjacent; `index` encodes visit order while
+`row`/`col` encode grid position (for the UI cells). Output: a
+`List<TilePosition{yaw, pitch, row, col, index}>` plus summary
+`{nCols, nRows, totalShots, hSpanDeg, vSpanDeg}` and the guard flags
+below.
 
-Edge cases the module must handle: `focalTaking ≤ focalStitch` (tiles
-wider than the span → 1×1 grid, not negative counts); `overlap` clamp;
-`focal ≤ 0` guard; very large grids (cap + warn — see risks).
+Edge cases & guards the module must handle:
+
+- `focalTaking ≤ focalStitch` / span ≤ tile → clamp `n_cols`/`n_rows`
+  to **1** (the `+1` formula overshoots near the boundary; clamp so a
+  same-FOV request is 1 tile, not 3). `overlap` clamp to `[0, 0.6]`;
+  `focal ≤ 0` guard.
+- **Tile-count guardrails** (flags, not exceptions): `totalShots > 50`
+  → `warnCount` (UI warns "N shots, sure?" but allows); `totalShots >
+  100` → `overCap` (UI **locks** Take — hard ceiling).
+- **Degenerate-panorama guard:** `coverageH = H_span / tile_h`,
+  `coverageV = V_span / tile_v`. If **both** are below **~1.5×**
+  (proposed, tunable) the stitched FOV is barely larger than a single
+  untiled frame — nothing meaningful to stitch → `degenerate` flag; UI
+  warns and **locks** Take. (A legit 1×N strip passes because one axis
+  clears 1.5×.)
+- **Coast floor:** with `overlap` capped at 0.6 and the 50–150 mm taking
+  range, `step_v ≳ 3.6°` — always above `moveByAngle`'s 1° pitch-skip
+  floor, so the floor can't silently drop rows. (The overlap cap is what
+  defuses it; no separate flag needed.)
 
 ### Sequencer state machine
 
@@ -3834,18 +3867,25 @@ issue the *delta from where we are*):
 
 1. Compute `(dYaw, dPitch)` = planned tile abs − last-commanded abs.
 2. `result = await session.moveByAngle(courseDeg: dYaw, pitchDeg: dPitch)`.
-3. If `result` residual exceeds the **per-tile tolerance (default 2°)**
-   → log a per-tile warning and continue (best-effort). No retry, no
-   abort, for now.
+3. **Log** `result`'s raw residual as a per-tile diagnostic (no
+   threshold, no GUI field — residual error is unrelated to the
+   stitching *overlap*). Gate only on **hard outcomes**: a `stalled` /
+   `timedOut` / `disconnected` warns/aborts; a small residual on a
+   `completed` move is just noted. No retry, for now.
 4. **Settle delay** (let vibration die before exposure) — distinct from
    PR 10's *capture delay* (see interaction note).
-5. **Capture.** Fire *without* the PR 10 countdown/sound overlay per
-   tile (immediate path). On a successful return, **recolour that
-   tile's cell** in the grid to mark it taken. First sweep pulls back
-   **no image** per tile — the full-resolution stills stay on the
-   camera's SD card for later stitching. (Per-tile thumbnails into the
-   cell are a later enhancement; see "Deferred".)
-6. **Inter-shot delay** before the next move.
+5. **Capture.** Fire via `CameraConnection.capture()` — already a bare
+   shutter with **no overlay, no sound, no fetch** (the post-capture
+   fetch is UI-triggered, not part of `capture()`). A **non-null error
+   string aborts the whole run** (mark the tile failed, stop). On
+   success, recolour the tile's cell. First sweep pulls back **no
+   image** — full stills stay on the SD card. (Per-tile thumbnails are a
+   later enhancement; see "Deferred".)
+6. **Completion wait.** `capture()` returns on command-ack, not when the
+   exposure/SD-write finishes. Wait a **min floor (~300 ms)**, then poll
+   `CameraConnection.isBusy` (the polled `sdAccess`) until idle, capped
+   by a **~10 s timeout** (both tunable). Only then move to the next
+   tile — so a long exposure isn't smeared by an early move.
 
 The sequencer tracks **commanded absolute** position, not measured, to
 accumulate the grid; but each move's *delta* is recomputed from the
@@ -3860,7 +3900,7 @@ Debug-Diagnostics. Its body holds:
 
 - **Taking-lens focal** input (slider, 50–150 mm, default 50).
 - **Stitched-image focal** input (slider, 24–100 mm, default 24).
-- **Overlap** slider (0–90 %, default 30 %).
+- **Overlap** slider (0–60 %, default 30 %).
 - **Settle delay** input (seconds, default **3 s**) — the wait after
   each gimbal movement stops, before the shutter fires (see "Settle
   delay" below).
@@ -3869,8 +3909,12 @@ Debug-Diagnostics. Its body holds:
   count** shown. (Span / estimated-duration readouts are optional for
   the first sweep.)
 - **"Take panorama"** button — snapshots the gimbal's current
-  orientation as the grid centre and starts the sequencer. Enabled only
-  when both gimbal and camera are connected.
+  orientation as the grid centre and starts the sequencer. **Enabled
+  only when**: both gimbal (real *or* virtual/demo) and camera are
+  connected, the grid is **not `degenerate`**, and **not `overCap`**
+  (>100 tiles). A `warnCount` (>50) or `degenerate` grid surfaces an
+  inline warning; `overCap`/`degenerate` additionally disable the
+  button.
 - **Cancel** button — stops a run in progress.
 
 During a run the same grid doubles as the progress view: each captured
@@ -3896,17 +3940,23 @@ Two independent delays, must not be conflated:
   and before the shutter fires, so mechanical settling doesn't smear the
   frame.
 
-### Capture path reuse
+### Capture path reuse — the "capture-only" path already exists
 
-`CameraConnection.captureWithDelay(int)` returns `Future<String?>`
-(null = success). For panorama tiles the first sweep uses the fire-now
-path **without** the PR 10 overlay/sound and **without** any
-post-capture image fetch (neither PR 8's full-LRG fetch nor a
-thumbnail) — the cell is simply recoloured on a null return. This likely
-needs a thin "capture-only, no fetch" entry point on `CameraConnection`,
-decided at impl time. Each tile checks the returned error string and
-applies the per-tile policy above (log + continue, 2° tolerance, no
-retry for now).
+**Finding (verified in code):** `CameraConnection.capture()` already
+fires `camcmd&value=capture` and returns `Future<String?>` (null = ok)
+with **no overlay, no sound, and no fetch** — the post-capture fetch
+(`fetchLastImage`) is triggered by the *Camera-tab UI*, not by
+`capture()`. So the planned PR 16a "capture-only entry point"
+**collapses**: the sequencer calls `capture()` directly and simply never
+calls `fetchLastImage`. No new `CameraConnection` method is required;
+the completion wait (min-floor → poll `isBusy` → timeout) lives in the
+controller.
+
+Also: camera-state polling already runs continuously from `connect()`
+to `disconnect()` (`_startPolling`), so `isBusy`/`sdAccess` is a **live
+signal during a run** with no extra wiring. And because panorama never
+touches the DLNA content server (no fetch), the camera never leaves
+record mode — the rec-mode precondition is just a check.
 
 ### Run lifecycle, preconditions & completion
 
@@ -3919,11 +3969,14 @@ A *complete* run needs more than the per-tile loop:
 - **Preconditions to start.** Both gimbal and camera connected; camera
   in **record mode** (not playback — `recMode`); grid at least 1×1.
   "Take panorama" is disabled otherwise.
-- **Lock-out during a run.** Manual gimbal control (Gimbal-tab pan /
-  tilt / Level) and the Pano inputs (focals, overlap, settle delay) are
-  **disabled** while a run is active; only Cancel stays live. Prevents a
-  manual `moveByAngle` colliding with the sequencer (`moveByAngle` is a
-  no-op while already `_moving`, but the planned grid would desync).
+- **Lock-out during a run** via a **`panoramaRunning` flag** on the
+  controller. The Gimbal-tab manual controls today gate on
+  `isConnected && !moving` — but `moving` is *false between tiles*, so
+  the buttons would flicker back on mid-run. The gimbal-tab gate and the
+  Pano inputs (focals, overlap, settle) must **also** check
+  `panoramaRunning`; only Cancel stays live. **Navigation is blocked**
+  during a run too (can't switch sub-tab/tab away from Pano) — not just
+  controls disabled.
 - **Live preview.** If the Capture sub-tab's MJPEG preview is running,
   the sequencer **stops it for the duration** (preview stream +
   keep-alive vs. rapid stills capture shouldn't compete); no need to
@@ -3948,18 +4001,23 @@ A *complete* run needs more than the per-tile loop:
   Full unit-test table across focal/overlap combinations and edge
   cases. No user-visible change yet.
 - **PR 15 — 'Pano' sub-tab (inputs + live tile grid).** Add the sub-tab
-  to the Camera `TabBar`; the two focal sliders + overlap drive PR 14's
-  math; the cell grid + tile count redraw live. No motion, no capture.
-- **PR 16 — Sequencer (motion + capture + progress + cancel + abort).**
-  A **riverpod-hosted `PanoramaController`** running the state machine on
-  top of `GimbalSession.moveByAngle` (needs PR 13's `MoveResult`) and a
-  new **capture-only, no-fetch** entry point on `CameraConnection`.
-  "Take panorama" snapshots centre and runs the serpentine grid with the
-  settle delay + per-tile exposure-completion wait; captured cells
-  recolour; manual gimbal control + Pano inputs lock out; live preview
-  stops for the duration; Cancel + abort-on-disconnect. Unit-tested
-  against fake transport + demo camera; verified end-to-end on demo,
-  then on hardware.
+  to the Camera `TabBar` (always present, not demo-gated); the two focal
+  sliders + overlap + settle-delay drive PR 14's math; the cell grid +
+  tile count redraw live; the `warnCount` / `overCap` / `degenerate`
+  flags surface warnings + button-locking. No motion, no capture
+  (buttons inert). Keep slider state alive across sub-tab switches
+  (`AutomaticKeepAliveClientMixin`).
+- **PR 16 — `PanoramaController` + wiring (motion + capture + progress +
+  cancel + abort).** A **riverpod-hosted `PanoramaController`** running
+  the state machine on `GimbalConnection.moveByAngle` (needs PR 13's
+  `MoveResult`) and the existing `CameraConnection.capture()` — **no new
+  capture entry point** (the "capture-only path" already exists; PR 16a
+  collapsed). Snapshots centre, runs the serpentine grid with settle
+  delay + completion wait, recolours cells, aborts the run on a tile
+  capture error, returns to centre on done/cancel, stops live preview,
+  exposes `panoramaRunning` to lock the gimbal tab + Pano inputs + block
+  navigation. Unit-tested vs fake transport + demo camera; verified
+  end-to-end on demo, then on hardware.
 
 Prerequisite: **PR 13** (the `GimbalSession` extraction + `MoveResult`
 return) lands before PR 16. PR 14 / PR 15 have no Phase-3 dependency and
@@ -3967,47 +4025,73 @@ can proceed in parallel.
 
 ### Verification checkpoints (Phase 4)
 
-- [ ] Grid math unit tests: known focal/overlap inputs produce expected
+- [x] Grid math unit tests: known focal/overlap inputs produce expected
       `n_cols`/`n_rows`/positions; symmetric around centre; degenerate
       inputs (taking ≤ stitched focal, overlap extremes) don't explode.
-- [ ] Live tile grid: changing either focal or overlap redraws the cell
+- [x] Live tile grid: changing either focal or overlap redraws the cell
       grid and updates the tile count immediately.
-- [ ] Demo end-to-end: connect demo gimbal + virtual Lumix → press
+- [x] Demo end-to-end: connect demo gimbal + virtual Lumix → press
       **Take panorama** → gimbal animates through the serpentine grid,
       camera "fires" at each tile, the tile's cell recolours, run reaches
-      `done`.
-- [ ] Cancel mid-run stops promptly; no further moves or captures.
+      `done`. *(Verified on the demo APK 2026-06-01.)*
+- [x] Guards: a grid >50 tiles warns; >100 locks Take; a near-single-
+      frame setup flags `degenerate` and locks Take.
+- [x] Lock-out: during a run the Gimbal-tab controls + Pano inputs are
+      disabled and navigation is blocked; Cancel stays live.
+- [ ] A tile capture error aborts the whole run (not just that tile).
+      *(Hard to trigger on the demo camera; verify on hardware.)*
+- [x] Cancel mid-run stops after the current tile and **returns to
+      centre**; clean completion also returns to centre.
 - [ ] Disconnect mid-run (gimbal or camera) → `aborted` with a clear
-      reason; app stays responsive.
+      reason, gimbal left in place; app stays responsive. *(Verify on
+      hardware.)*
 - [ ] Hardware: a real small grid (e.g. 3×3) on the SCORP-C2 + S5 lands
       tiles with visible overlap; residual error doesn't compound across
       the grid (closed-loop delta-from-measured holds).
 - [ ] Settle delay actually reduces motion blur vs. zero-settle (bench
       observation).
 
+### Phase 4 — as built (PR 14–16, demo-verified 2026-06-01)
+
+- **PR 14** — `lib/panorama/panorama_grid.dart`: pure-Dart
+  `computePanoramaGrid(...)` → `PanoramaGrid` (tiles in serpentine order
+  + `warnCount`/`overCap`/`degenerate` flags). 10 unit tests.
+- **PR 15** — `lib/ui/tabs/pano_tab.dart`: the 'Pano' sub-tab (4th in the
+  Camera `TabBar`), two focal sliders + overlap (0–60 %) + settle (0–10
+  s), live cell grid that recolours per tile, Take/Cancel.
+- **PR 16** — `lib/state/panorama_controller.dart`: riverpod
+  `PanoramaController` running the serpentine sequencer on
+  `GimbalConnection.moveByAngle` + `CameraConnection.capture()` (the
+  capture-only path; PR 16a collapsed — no new camera method). Per-tile
+  completion wait = 300 ms floor → poll `isBusy` → 10 s cap. Lock-out via
+  `running` wired into the gimbal tab, Pano inputs, sub-tab `TabBar`, and
+  the bottom nav. 7 controller unit tests.
+- **Not yet verified on hardware:** real SCORP-C2 + S5 run (motion feel,
+  overlap, `sdAccess` completion timing), tile-error abort, and
+  disconnect-abort. The demo path exercises everything else end-to-end.
+
 ### Risks & open questions (Phase 4)
 
-- **`moveByAngle` convergence reporting.** Phase 3 must land the
-  `MoveResult` return first (PR 13); the sequencer's per-tile
-  best-effort/abort policy depends on it.
-- **Capture-only path.** PR 10's overlay and PR 8's full-LRG fetch are
-  both undesirable per-tile. Need a lean "capture-only, no fetch" entry
-  point; confirm the S5 can fire fast enough back-to-back to keep the
-  run brisk.
-- **Camera-state polling during a run.** The per-tile completion wait
-  relies on `sdAccess`/`isBusy`, so camera-state polling must run for the
-  duration even though the capture path fetches nothing. Confirm the poll
-  cadence reliably observes the busy window for fast shutter speeds (the
-  fixed minimum floor is the backstop when it doesn't).
+- **`moveByAngle` outcome reporting.** Phase 3 must land the
+  `MoveResult` return first (PR 13); the sequencer's hard-outcome
+  gating + residual logging depends on it.
+- **Capture-only path — resolved.** `CameraConnection.capture()` is
+  already a bare, no-fetch shutter; PR 16a collapsed (see "Capture path
+  reuse"). Remaining: confirm on the S5 that back-to-back
+  `capture()` + `isBusy` completion-wait keeps the run brisk.
+- **Camera-state polling during a run.** The completion wait relies on
+  the always-on `sdAccess`/`isBusy` poll. Confirm the poll cadence
+  reliably observes the busy window for fast shutter speeds (the ~300 ms
+  minimum floor is the backstop when it doesn't).
 - **Yaw wrap / large pans.** A wide stitched-image focal + long taking
-  lens can produce a big `n_cols`; cap total shots with a warning rather
-  than silently launching a 200-shot run. Also confirm `_angleDiff`
-  wrap-around behaves for yaw deltas crossing ±180°.
-- **Pitch limits & coast compensation.** `moveByAngle` pre-subtracts a
-  1° pitch coast and skips sub-1° pitch moves — a fine grid with
-  `step_v < 1°` would drop every pitch step. The sequencer must account
-  for the coast-compensation floor (and the gimbal's mechanical pitch
-  range) when validating a grid.
+  lens can produce a big `n_cols`; the `warnCount` (>50) / `overCap`
+  (>100) guards handle this. Also confirm `_angleDiff` wrap-around
+  behaves for yaw deltas crossing ±180°.
+- **Pitch coast floor — defused by the overlap cap.** `moveByAngle`
+  skips sub-1° pitch moves; at the 0.6 overlap cap and 50–150 mm taking
+  range, `step_v ≳ 3.6°`, so this can't bite. Still validate the
+  gimbal's mechanical **pitch range** isn't exceeded by a tall grid.
+
 ### Deferred (later enhancements, not in the first sweep)
 
 - **Per-tile thumbnails into the grid cells** (a true contact sheet),
