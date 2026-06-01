@@ -3624,38 +3624,489 @@ PR 5 and PR 6's EV-compensation have since landed and verified on
 hardware. The PR 6 single-shot self-timer is now specified as
 PR 10 (capture delay + capture sounds), pending implementation.
 
-## Phase 3 — protocol library (outline only)
+## Phase 3 — Gimbal motion library (extraction)
 
-Promote `lib/protocol/` into a standalone Dart package
-(`packages/feiyu_protocol/`). Typed command API:
-`gimbal.rotateAbsolute(yaw: …, pitch: …, roll: …)` etc.
-Stream-based status push (current angles, mode, errors). Unit tests
-with recorded frame fixtures from the Playground.
+**Goal.** Lift the gimbal protocol *and* closed-loop motion logic out
+of the Flutter-coupled `GimbalConnection` into a standalone, in-repo,
+framework-free Dart package so Phase 4's sequencer can be built and
+unit-tested without hardware and without Flutter widgets.
 
-## Phase 4 — panorama app (outline only)
+> **Spec correction.** The original outline said "promote
+> `lib/protocol/`" — there is no such directory. The gimbal code today
+> lives in `lib/ble/` (wire layer) and `lib/state/gimbal_connection.dart`
+> (motion + UI state). This section supersedes that outline.
 
-Add a third screen with the Brenizer workflow:
+### What "framework-free package" means here
 
-- Level button → `rotateAbsolute(0, 0, 0)`.
-- Frame-lens focal input (default 24 mm).
-- Capture-lens focal input (default 90 mm).
-- Overlap slider (default 30 %).
-- "Read framing" button → reads current gimbal yaw / pitch as panorama
-  centre and remembers it.
-- Computed preview: total H/V span, grid dimensions, total shot count,
-  estimated duration.
-- Start → sequencer: for each (yaw_i, pitch_j), rotateAbsolute → settle
-  delay → takePhoto → inter-shot delay → next.
-- Progress UI, cancel button, abort on disconnect.
+It does **not** mean "no Bluetooth". The package depends on the
+**abstract `GimbalTransport`** interface (a pure byte channel:
+`sendFrame`, `incoming` stream, `disconnected`, lifecycle phases) that
+already exists at `lib/ble/transport/gimbal_transport.dart`. The
+concrete `BleGimbalTransport` — the only thing that imports
+`flutter_blue_plus` — **stays in the app** and is injected at runtime,
+exactly as it is today via `connect(GimbalTransport)`. Bluetooth never
+enters the package; it arrives through the interface.
 
-Math:
-- `H_span = 2·atan(17.5 / focal_frame)`, `V_span = 2·atan(12 /
-  focal_frame)`.
-- `step_h = 2·atan(17.5 / focal_capture) · (1 − overlap)`, similarly
-  `step_v`.
-- `n_cols = ceil(H_span / step_h) + 1`, `n_rows = ceil(V_span / step_v)
-  + 1`.
-- Grid is symmetric around the captured `(centre_yaw, centre_pitch)`.
+The only genuinely framework-coupled aspects of `GimbalConnection`
+today are that it `extends ChangeNotifier` and imports
+`flutter_riverpod`. The extraction drops both: the package exposes
+status as a **`Stream`** (current angles, follow-mode, move-in-progress,
+errors), and the app keeps a thin riverpod/`ChangeNotifier` adapter
+around it so the existing UI bindings are unchanged.
+
+### Package shape — `packages/feiyu_gimbal/`
+
+In-repo local package (path dependency in the app's `pubspec.yaml`),
+**not** published to pub.dev. Same git history, same PRs.
+
+Moves into the package (pure Dart, no `package:flutter`):
+
+- The whole `lib/ble/` wire layer — `commands.dart`, `crc.dart`,
+  `frame_codec.dart`.
+- The `GimbalTransport` abstract interface and `DemoGimbalTransport`
+  (already pure Dart).
+- The motion / orientation logic currently tangled in
+  `GimbalConnection`: `moveByAngle`, `levelHome`, `gotoAngle`
+  (kept but still flagged speculative), `_runSinglePass`, stall
+  detection, arrival-margin and coast-compensation constants, and the
+  `_onFrame` orientation parser. Re-homed onto a plain `GimbalSession`
+  (name TBD) class that takes a `GimbalTransport` and emits a status
+  `Stream` — no `ChangeNotifier`, no `notifyListeners`.
+
+Stays in the app:
+
+- `BleGimbalTransport` (`flutter_blue_plus`).
+- A thin `GimbalConnection` adapter: wraps `GimbalSession`, forwards
+  the status `Stream` into `notifyListeners()`, preserves the current
+  riverpod provider and every getter the UI reads (`yawDeg`,
+  `pitchDeg`, `isConnected`, `moving`, `log`, …) so widgets don't
+  change.
+
+### Typed motion API the package exposes
+
+Given the **relative-only** decision (Phase 4), the package does **not**
+promise a working absolute goto. The contract is:
+
+- `Future<MoveResult> moveByAngle({double courseDeg, double pitchDeg})`
+  — the existing closed-loop relative move, but it now **returns a
+  result** instead of only logging: final residual error per axis +
+  whether it converged within tolerance. (Today it returns `void`;
+  Phase 4 needs to know whether a tile move actually landed.)
+- `Future<void> levelHome()` — unchanged closed-loop level-to-(0,0).
+- `Stream<GimbalStatus> status` — angles, follow-mode, `moving`,
+  errors.
+- `gotoAngle(...)` — carried over but **kept marked speculative**;
+  Phase 4 must not depend on it.
+
+### PR breakdown
+
+- **PR 12 — Create the package, move the wire layer.** New
+  `packages/feiyu_gimbal/` with `commands`/`crc`/`frame_codec` +
+  `GimbalTransport` + `DemoGimbalTransport`. App imports flip from
+  `lib/ble/...` to `package:feiyu_gimbal/...`. No behaviour change.
+  Existing wire-layer tests move with the code and stay green.
+- **PR 13 — Extract `GimbalSession` (motion logic).** Move the motion
+  + orientation logic onto the framework-free session class with a
+  status `Stream`; reduce `GimbalConnection` to the adapter. Add
+  `MoveResult` return to `moveByAngle`. **New unit tests** drive
+  `GimbalSession` against `DemoGimbalTransport` (and/or a scripted
+  fake) — convergence, residual reporting, stall/timeout, no-op
+  guards — all with zero hardware and zero Flutter.
+
+### Verification checkpoints (Phase 3)
+
+- [ ] Real SCORP-C2: connect / pan / tilt / Level behave **identically**
+      to pre-PR-12 (this is a refactor; the on-hardware feel is the
+      regression test).
+- [ ] Demo gimbal still connects and animates as before.
+- [ ] `flutter analyze` clean; the app no longer imports anything from
+      a `lib/ble/` path.
+- [ ] New `GimbalSession` unit tests pass against a fake transport with
+      no Flutter test binding.
+- [ ] Camera tab, 3D visualization, devices panel — all unchanged
+      (nothing outside the gimbal stack was touched).
+
+### Risks & open questions (Phase 3)
+
+- **Hidden `notifyListeners` coupling.** Some widgets may rely on the
+  precise *timing* of `ChangeNotifier` rebuilds (e.g. mid-move
+  repaints of the 3D view). The adapter must forward status-stream
+  events synchronously enough to preserve that; verify the
+  visualization still tracks live motion.
+- **Log plumbing.** Motion code currently calls `appendLog(...)` on the
+  `ChangeNotifier`. The package can't depend on the app's log model —
+  `GimbalSession` should emit log lines onto its status/event stream
+  and let the adapter fold them into the existing `LogEntry` list.
+- **Test seam for closed-loop.** `_runSinglePass` uses real
+  `Future.delayed` settle waits. For fast, deterministic unit tests we
+  may want an injectable clock/delay; decide whether to add one in
+  PR 13 or accept real-time waits in tests.
+
+## Phase 4 — Panorama sequencer
+
+The app's reason for existing: drive the gimbal through a Brenizer
+grid and fire the shutter at each tile. Built **on top of Phase 3's
+`feiyu_gimbal` package** (decision: extraction first).
+
+### Decisions (confirmed in discussion, 2026-06-01)
+
+- **Relative-only motion.** The sequencer never uses absolute goto. It
+  steps **tile-to-tile by relative deltas** via
+  `moveByAngle({courseDeg, pitchDeg})`. The speculative `gotoAngle`
+  (wire cmd 93, not declared-supported on SCORP-C2) is not used. The
+  demo transport already mirrors this — it simulates relative moves and
+  silently ignores cmd 93.
+- **Phase 3 first.** The sequencer is built against the extracted
+  `GimbalSession` API, so the sequencer loop is unit-testable against a
+  fake transport.
+- **Grid math is a pure Dart module**, unit-tested with no hardware and
+  no Flutter (`packages/feiyu_gimbal/` or a small `lib/panorama/`
+  module — placement decided at impl time; it has no transport
+  dependency either way).
+- **Demo-first (hard gate).** Tiles are captured on the **demo devices
+  first** — the full sequence must run end-to-end against the demo
+  gimbal + virtual Lumix S5 (PR 9) before pointing at real glass. This
+  requires the demo Lumix's bundled asset image to be **tiled in
+  memory**: each tile capture returns a *different* sub-region of the
+  asset so the on-screen contact sheet shows a real mosaic, not the
+  same frame N times.
+
+### Grid math (pure module)
+
+Sensor model: full-frame 36×24 mm → half-extents 18 mm × 12 mm. *(The
+original outline used 17.5 mm half-width; impl uses the true 18 mm
+unless a measured value supersedes it.)*
+
+Inputs: `focalFrame` mm (composition lens, default 24), `focalCapture`
+mm (taking lens, default 90), `overlap` fraction 0–0.9 (default 0.30),
+`centreYaw`, `centrePitch` degrees (from Read Framing).
+
+```
+H_span   = 2·atan(halfW / focalFrame)        // total horizontal extent to cover
+V_span   = 2·atan(halfH / focalFrame)        // total vertical extent
+tile_h   = 2·atan(halfW / focalCapture)      // one tile's horizontal FOV
+tile_v   = 2·atan(halfH / focalCapture)
+step_h   = tile_h · (1 − overlap)            // centre-to-centre spacing
+step_v   = tile_v · (1 − overlap)
+n_cols   = ceil(H_span / step_h) + 1
+n_rows   = ceil(V_span / step_v) + 1
+```
+
+Grid is **symmetric** around `(centreYaw, centrePitch)`: column `i`
+(0…n_cols−1) sits at `centreYaw + (i − (n_cols−1)/2)·step_h`, similarly
+for rows. Output: a `List<TilePosition{yaw, pitch, row, col}>` plus
+summary `{nCols, nRows, totalShots, hSpanDeg, vSpanDeg, estDuration}`.
+
+Edge cases the module must handle: `focalCapture ≤ focalFrame` (tiles
+wider than the span → 1×1 grid, not negative counts); `overlap` clamp;
+`focal ≤ 0` guard; very large grids (cap + warn — see risks).
+
+### Sequencer state machine
+
+States: `idle → running → (paused?) → done | cancelled | aborted`.
+The serpentine order (boustrophedon: row 0 left→right, row 1
+right→left, …) minimises total travel and avoids a long yaw sweep-back
+between rows.
+
+Per tile, **relative** stepping (we hold the planned absolute grid but
+issue the *delta from where we are*):
+
+1. Compute `(dYaw, dPitch)` = planned tile abs − last-commanded abs.
+2. `result = await session.moveByAngle(courseDeg: dYaw, pitchDeg: dPitch)`.
+3. If `result` residual exceeds the **per-tile tolerance (default 2°)**
+   → log a per-tile warning and continue (best-effort). No retry, no
+   abort, for now.
+4. **Settle delay** (let vibration die before exposure) — distinct from
+   PR 10's *capture delay* (see interaction note).
+5. **Capture.** Fire *without* the PR 10 countdown/sound overlay per
+   tile (immediate path). Pull back a **thumbnail** per tile (not the
+   full LRG JPEG) and place it in an on-screen **contact sheet** at the
+   tile's grid position, so the user watches the mosaic fill in. The
+   full-resolution stills stay on the camera's SD card for later
+   stitching. (Thumbnail fetch must stay cheap enough not to dominate
+   the run — see risks.)
+6. **Inter-shot delay** before the next move.
+
+The sequencer tracks **commanded absolute** position, not measured, to
+accumulate the grid; but each move's *delta* is recomputed from the
+session's **measured** current angle so closed-loop residual error
+doesn't compound across the grid.
+
+### UI — third surface
+
+A **dedicated panorama screen** (not a tab inside the playground),
+with:
+
+- **Read Framing** button → snapshots current `(yawDeg, pitchDeg)` as
+  the grid centre; shows the captured centre and a "re-read" affordance.
+- Frame-lens focal input (default 24 mm), capture-lens focal input
+  (default 90 mm), overlap slider (default 30 %).
+- **Live computed preview**: H/V span, `n_cols × n_rows`, total shots,
+  estimated duration — recomputed as inputs change.
+- **Start** (enabled only when both gimbal and camera are connected and
+  a centre has been read).
+- **Progress UI** during a run: current tile `k / total`, a grid
+  position indicator, elapsed/remaining estimate, and a **Cancel**
+  button.
+- **Abort on disconnect**: if either the gimbal or the camera drops
+  mid-run, stop immediately, surface why, leave the gimbal where it is
+  (no auto-return).
+
+### Settle delay vs. PR 10 capture delay
+
+Two independent delays, must not be conflated:
+
+- **PR 10 capture delay** — a user-facing self-timer with countdown UI
+  + beeps, for single hand-off shots. **Not used per-tile** in a
+  panorama (no countdown spam across dozens of tiles).
+- **Phase 4 settle delay** — a short, fixed (configurable) wait after
+  the gimbal stops and before the shutter, so mechanical settling
+  doesn't smear the frame. New Phase-4 setting, defaulting to a
+  conservative value tuned on hardware.
+
+### Capture path reuse
+
+`CameraConnection.captureWithDelay(int)` returns `Future<String?>`
+(null = success). For panorama tiles we want the fire-now path
+**without** the PR 10 overlay/sound, and a **thumbnail** fetch rather
+than PR 8's full-LRG fetch+display into `capturedImage`. This likely
+needs a thin "capture + thumbnail" entry point on `CameraConnection`,
+decided at impl time. The thumbnail feeds the contact sheet; the full
+still is left on the SD card. Each tile checks the returned error
+string and applies the per-tile policy above (log + continue, 2°
+tolerance, no retry for now).
+
+### PR breakdown (later)
+
+- **PR 14 — Grid math module + tests.** Pure Dart, no UI, no transport.
+  Full unit-test table across focal/overlap combinations and edge
+  cases. No user-visible change yet.
+- **PR 15 — Panorama screen (inputs + computed preview).** UI binds to
+  PR 14's math; Read Framing snapshots centre. No motion, no capture.
+- **PR 16 — Sequencer (motion + capture + progress + cancel + abort).**
+  The state machine on top of `GimbalSession.moveByAngle` and the
+  silent-capture path. Unit-tested against fake transport + demo
+  camera; verified end-to-end on demo, then on hardware.
+
+### Verification checkpoints (Phase 4)
+
+- [ ] Grid math unit tests: known focal/overlap inputs produce expected
+      `n_cols`/`n_rows`/positions; symmetric around centre; degenerate
+      inputs (capture ≤ frame focal, overlap extremes) don't explode.
+- [ ] Demo end-to-end: connect demo gimbal + virtual Lumix → read
+      framing → Start → gimbal animates through the serpentine grid,
+      camera "fires" at each tile, progress advances, run reaches
+      `done`.
+- [ ] Cancel mid-run stops promptly; no further moves or captures.
+- [ ] Disconnect mid-run (gimbal or camera) → `aborted` with a clear
+      reason; app stays responsive.
+- [ ] Hardware: a real small grid (e.g. 3×3) on the SCORP-C2 + S5 lands
+      tiles with visible overlap; residual error doesn't compound across
+      the grid (closed-loop delta-from-measured holds).
+- [ ] Settle delay actually reduces motion blur vs. zero-settle (bench
+      observation).
+
+### Risks & open questions (Phase 4)
+
+- **`moveByAngle` convergence reporting.** Phase 3 must land the
+  `MoveResult` return first (PR 13); the sequencer's per-tile
+  best-effort/abort policy depends on it.
+- **Thumbnail capture path.** PR 10's overlay and PR 8's full-LRG
+  fetch are both undesirable per-tile. Need a lean "capture +
+  thumbnail" entry point; confirm the S5 can fire and hand back a
+  thumbnail fast enough not to dominate the run.
+- **Demo asset tiling.** The virtual Lumix must serve a *different*
+  sub-region of its bundled asset per tile so the demo contact sheet is
+  a real mosaic; PR 9 today returns one fixed image. New demo-path work,
+  required by the demo-first gate.
+- **Yaw wrap / large pans.** Wide frame lens + narrow taking lens can
+  produce a big `n_cols`; cap total shots with a warning rather than
+  silently launching a 200-shot run. Also confirm `_angleDiff`
+  wrap-around behaves for yaw deltas crossing ±180°.
+- **Pitch limits & coast compensation.** `moveByAngle` pre-subtracts a
+  1° pitch coast and skips sub-1° pitch moves — a fine grid with
+  `step_v < 1°` would drop every pitch step. The sequencer must account
+  for the coast-compensation floor (and the gimbal's mechanical pitch
+  range) when validating a grid.
+- **Navigation to the dedicated panorama screen** from the post-PR-11
+  app shell — the entry point (header action vs. elsewhere) is a UX
+  decision for PR 15. The screen itself is dedicated (decided), not a
+  playground tab.
+
+## Phase 5 — Hand-off to a separate image-viewer app (outline)
+
+A separate Android app — working title `panoramique_viewer`,
+`applicationId` TBD, language/framework TBD — is the destination
+when the user **double-taps a captured image** in Panoramique. The
+receiver provides viewing now and image processing later;
+Panoramique itself only owns the hand-off contract.
+
+This phase **modifies PR 8's double-tap behavior**: instead of
+opening the in-app full-screen `InteractiveViewer`, the double-tap
+launches the viewer app and passes the captured JPEG by URI.
+
+### Decisions (confirmed in discussion)
+
+- **The viewer is a separate APK.** Not an additional Activity
+  inside Panoramique. Decided so the image-processing surface can
+  evolve independently and be installed in isolation.
+- **Read-only hand-off for now.** No write-back to Panoramique. The
+  viewer may save its own outputs to its own storage; Panoramique
+  does not consume anything from the viewer.
+- **The source image lives in Panoramique's private storage** —
+  not in `MediaStore` / the public gallery. PR 8 already pulls the
+  LRG JPEG from the camera's UPnP server; the bytes need to be
+  written to disk in Panoramique's `cacheDir` (or `filesDir`) so
+  that a `FileProvider` can hand out a `content://` URI to them. If
+  a later phase publishes captures into the public gallery, the
+  contract simplifies to a plain `MediaStore` URI with no other
+  change.
+- **Intent shape: custom action string** —
+  `at.sciens.gimbal_controller.action.OPEN_FULL` (namespaced under
+  the existing `applicationId`, which PR 11 froze at
+  `at.sciens.gimbal_controller`). The viewer declares an
+  `<intent-filter>` for exactly that action, so no `ACTION_VIEW`
+  chooser dialog is shown. On `ActivityNotFoundException` (viewer
+  not installed) Panoramique falls back to the PR 8 in-app
+  full-screen route — feature still works without the viewer
+  present.
+- **Payload is a `content://` URI**, never the bitmap bytes. Passed
+  via `Intent.setDataAndType(uri, "image/jpeg")` +
+  `FLAG_GRANT_READ_URI_PERMISSION` so the viewer's process can
+  `openInputStream(uri)` across the app boundary without copying
+  through the Binder IPC limit (~1 MB).
+- **Viewer chooses its own decode resolution.** Panoramique forwards
+  the original LRG JPEG by URI; the viewer decodes at whatever size
+  it wants (`BitmapFactory.Options.inSampleSize` or equivalent). No
+  pre-downscaled "medium" variant is sent — Panoramique already
+  caches SM + LRG locally from PR 8, but only the LRG URI is
+  forwarded so the viewer is in charge of its memory budget.
+
+### Panoramique side — what changes from PR 8
+
+Files / artifacts added:
+
+- `android/app/src/main/AndroidManifest.xml` — a `<provider>` entry
+  for `androidx.core.content.FileProvider`, authority
+  `at.sciens.gimbal_controller.fileprovider`, pointing at:
+- `android/app/src/main/res/xml/file_paths.xml` — a small whitelist
+  exposing the directory where PR 8's cached JPEGs are written
+  (`cache-path name="captured" path="."` or similar; final dir name
+  decided at impl time).
+- `android/app/src/main/java/at/sciens/gimbal_controller/ImageHandoffChannel.java`
+  — a `MethodChannel` named
+  `at.sciens.gimbal_controller/image_handoff` (following the
+  existing `WifiNetworkChannel` / `NsdChannel` pattern) exposing
+  one method, `openFullSize(filePath)`:
+  1. Wrap the path in a `File`.
+  2. `Uri uri = FileProvider.getUriForFile(context,
+     "at.sciens.gimbal_controller.fileprovider", file);`
+  3. `Intent intent = new Intent("at.sciens.gimbal_controller.action.OPEN_FULL");`
+     `intent.setDataAndType(uri, "image/jpeg");`
+     `intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION | FLAG_ACTIVITY_NEW_TASK);`
+  4. `try { context.startActivity(intent); return true; } catch
+     (ActivityNotFoundException e) { return false; }`
+
+Edits to existing code:
+
+- `lib/camera/lumix_content.dart` (or wherever PR 8 currently
+  decodes the LRG JPEG): **also persist the bytes to a cache file**
+  inside the directory whitelisted by `file_paths.xml`. PR 8 today
+  keeps the LRG bytes in memory for `decodeJpeg`; Phase 5 needs a
+  real file path because `FileProvider` serves on-disk content
+  only. A single overwriting filename (`last_capture.jpg`) is
+  sufficient — scope is the last shot, just like PR 8.
+- `lib/ui/tabs/camera_tab.dart` — the double-tap handler in
+  `_CameraPane` calls `ImageHandoffChannel.openFullSize(path)`. If
+  the channel returns `false`, fall through to the existing PR 8
+  push of `_FullScreenImage`. `_FullScreenImage` is **kept** as the
+  graceful-degradation path, not deleted.
+- `MainActivity.java` — register `ImageHandoffChannel` alongside
+  the existing `WifiNetworkChannel` and `NsdChannel` in
+  `configureFlutterEngine`.
+
+Demo Lumix path (PR 9): the synthetic captured image must exist on
+disk for `FileProvider` to serve it. PR 9 currently bundles it as an
+asset; the hand-off path writes the asset bytes out to the same
+cache directory at "capture" time so the same `openFullSize(path)`
+call works in demo mode.
+
+### Viewer app — minimum receiving contract
+
+Whatever framework that app uses, it must declare an Activity
+matching the hand-off action. In native-Android form:
+
+```xml
+<activity android:name=".ViewerActivity" android:exported="true">
+  <intent-filter>
+    <action android:name="at.sciens.gimbal_controller.action.OPEN_FULL"/>
+    <category android:name="android.intent.category.DEFAULT"/>
+    <data android:mimeType="image/jpeg"/>
+  </intent-filter>
+</activity>
+```
+
+In `onCreate`, the activity reads `intent.getData()` (a
+`content://` URI) and opens an `InputStream` via
+`getContentResolver().openInputStream(uri)`. The read permission
+granted by Panoramique stays valid for the lifetime of that
+activity instance.
+
+The viewer app's own scope — UI, decode strategy, processing
+primitives, persistence, whether write-back to Panoramique ever
+gets added — lives in **its own SPEC document** when that project
+starts. This section only captures the contract Panoramique
+relies on.
+
+### Verification checkpoints (Phase 5)
+
+- [ ] Capture an image in Panoramique → double-tap the still in the
+      pane → the viewer app launches and shows the image in its own
+      UI within ~1 s.
+- [ ] With the viewer **not installed**: same double-tap →
+      Panoramique falls back to the PR 8 in-app `_FullScreenImage`
+      route; no crash, no error toast.
+- [ ] The viewer can decode and display the image at its chosen
+      resolution. It does **not** receive pixel bytes through intent
+      extras — the URI grant is its only handle.
+- [ ] Demo Lumix S5 path (PR 9): same hand-off works against the
+      synthetic captured image (asset materialised to the cache dir
+      at "capture" time).
+- [ ] Killing the viewer app and re-double-tapping in Panoramique
+      re-launches it with a fresh URI grant; old grants do not need
+      to remain valid.
+- [ ] Concurrent sessions: hand-off does not perturb the gimbal or
+      camera connection — both stay connected through the
+      Activity-switch.
+
+### Risks & open questions
+
+- **PR 8 currently keeps the LRG JPEG in memory only.** Confirm at
+  impl time whether `lumix_content.dart` already touches disk; if
+  not, the cache-write is real new work (small, but non-zero) and
+  must be done in the same dir that `file_paths.xml` whitelists.
+- **`FileProvider` requires androidx.core in the Android source
+  set.** Already pulled in transitively by Flutter; verify on
+  `flutter build apk --debug` after adding the provider.
+- **Activity re-launch behaviour.** Without `FLAG_ACTIVITY_NEW_TASK`
+  on a non-Activity context the launch fails on some Android
+  versions; including it from the start. Whether the viewer
+  uses `singleTask` / `singleTop` / default `standard` launch mode
+  is the viewer's choice and not Panoramique's concern.
+- **Custom action string discoverability.** Tools like the system
+  share-sheet won't surface our action — that's intentional. The
+  viewer is reached only through Panoramique's deliberate launch.
+
+### Out of scope (Phase 5)
+
+- Write-back from the viewer to Panoramique.
+- Multi-image hand-off (sending a whole panorama batch in one go).
+- A picker UI to choose between the in-app PR-8 viewer and the
+  external viewer — the external viewer wins when installed; the
+  in-app one is a fallback, not a presented option.
+- The viewer app's own internals; specified separately when that
+  project starts.
+- iOS / desktop / web targets (still excluded).
 
 ## Out of scope (entire project)
 
