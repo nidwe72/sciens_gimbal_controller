@@ -1,0 +1,16 @@
+name: feiyu_gimbal
+description: >-
+  Framework-free Dart library for the Feiyu SCORP gimbal: the AK wire
+  protocol (CRC, frame codec, command builders), the abstract
+  GimbalTransport byte channel, and a pure-Dart demo transport. No
+  Flutter or BLE-plugin dependency — concrete transports (e.g. BLE)
+  are injected by the host app.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.5
+
+dev_dependencies:
+  test: ^1.25.0
+  fake_async: ^1.3.1

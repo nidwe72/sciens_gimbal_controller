@@ -1,11 +1,8 @@
 import 'dart:async';
 
+import 'package:feiyu_gimbal/feiyu_gimbal.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/legacy.dart';
-
-import '../ble/commands.dart';
-import '../ble/frame_codec.dart';
-import '../ble/transport/gimbal_transport.dart';
 
 const _logCapacity = 500;
 

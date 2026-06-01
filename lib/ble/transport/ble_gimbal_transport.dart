@@ -1,8 +1,7 @@
 import 'dart:async';
 
+import 'package:feiyu_gimbal/feiyu_gimbal.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-
-import 'gimbal_transport.dart';
 
 /// SCORP "g6" profile (uuidType=1 in gimbal-properties-ble.xml).
 /// Shared service for write and notify; see PROTOCOL-NOTES §2.

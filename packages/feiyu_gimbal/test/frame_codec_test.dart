@@ -1,8 +1,7 @@
 import 'dart:typed_data';
 
-import 'package:flutter_test/flutter_test.dart';
-import 'package:sciens_gimbal_controller/ble/crc.dart';
-import 'package:sciens_gimbal_controller/ble/frame_codec.dart';
+import 'package:feiyu_gimbal/feiyu_gimbal.dart';
+import 'package:test/test.dart';
 
 void main() {
   group('crc16Xmodem', () {

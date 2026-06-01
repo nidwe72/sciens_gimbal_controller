@@ -1,8 +1,6 @@
 import 'package:fake_async/fake_async.dart';
-import 'package:flutter_test/flutter_test.dart';
-import 'package:sciens_gimbal_controller/ble/commands.dart';
-import 'package:sciens_gimbal_controller/ble/frame_codec.dart';
-import 'package:sciens_gimbal_controller/ble/transport/demo_gimbal_transport.dart';
+import 'package:feiyu_gimbal/feiyu_gimbal.dart';
+import 'package:test/test.dart';
 
 void main() {
   group('DemoGimbalTransport — identity & lifecycle', () {

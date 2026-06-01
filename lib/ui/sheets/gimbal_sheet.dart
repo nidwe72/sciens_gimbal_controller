@@ -1,13 +1,12 @@
 import 'dart:async';
 
+import 'package:feiyu_gimbal/feiyu_gimbal.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../ble/transport/ble_gimbal_transport.dart';
-import '../../ble/transport/demo_gimbal_transport.dart';
-import '../../ble/transport/gimbal_transport.dart';
 import '../../state/gimbal_connection.dart';
 import '../device_row.dart';
 
