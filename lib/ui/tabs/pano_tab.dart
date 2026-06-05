@@ -159,6 +159,11 @@ class _PanoTabState extends ConsumerState<PanoTab>
                 label: Text('OpenPano'),
                 icon: Icon(Icons.auto_awesome),
               ),
+              ButtonSegment(
+                value: StitchMode.affine,
+                label: Text('Affine'),
+                icon: Icon(Icons.dashboard_customize),
+              ),
             ],
             selected: {pano.stitchMode},
             showSelectedIcon: false,
@@ -197,6 +202,25 @@ class _PanoTabState extends ConsumerState<PanoTab>
             ),
           ],
         ),
+        // Live stitch progress — for the affine path this is the server's
+        // stitchEvents stream made visible (stage + percentage + bar).
+        if (pano.stitching && pano.stitchStage != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  pano.stitchProgress != null
+                      ? '${pano.stitchStage}  ${(pano.stitchProgress! * 100).round()}%'
+                      : pano.stitchStage!,
+                  style: theme.textTheme.bodySmall,
+                ),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(value: pano.stitchProgress),
+              ],
+            ),
+          ),
         if (pano.stitchError != null)
           Padding(
             padding: const EdgeInsets.only(top: 8),

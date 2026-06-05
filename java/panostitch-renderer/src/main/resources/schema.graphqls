@@ -1,0 +1,63 @@
+# Panostitch renderer — GraphQL schema.
+#
+# Same shape as petzvalStudio's renderer, slimmed to a single `stitch` op.
+# Image bytes do NOT cross the GraphQL boundary: tiles go up via POST /upload
+# (one per tile, returns an uploadId), the stitched PNG comes back via
+# GET /result/{stitchId}. GraphQL carries only ids, progress, and status.
+
+schema {
+  query:        Query
+  mutation:     Mutation
+  subscription: Subscription
+}
+
+type Query {
+  "Renderer version. Sanity-check probe for the Dart client."
+  version: String!
+}
+
+type Mutation {
+  """
+  Stitch a set of previously-uploaded tiles. `uploadIds` are the ids from
+  POST /upload, in stitch order. Returns a `stitchId` immediately; progress
+  and the terminal result arrive via the `stitchEvents` subscription, and the
+  stitched PNG is fetched from GET /result/{stitchId}.
+  """
+  stitch(uploadIds: [ID!]!, nCols: Int): ID!
+
+  "Ask an in-flight stitch to stop at the next step boundary."
+  cancel(stitchId: ID!): Boolean!
+}
+
+type Subscription {
+  """
+  Progress + final result for a stitch. The server emits PROGRESS events with
+  a monotonic `done` in [0,1], then a single terminal event
+  (COMPLETED / CANCELLED / FAILED), then closes the stream.
+  """
+  stitchEvents(stitchId: ID!): StitchEvent!
+}
+
+type StitchEvent {
+  stitchId: ID!
+  phase:    String!
+  done:     Float
+  "Set on the terminal event when the stitch succeeded (bytes via GET /result)."
+  result:   StitchResult
+  "Set on the terminal event when the stitch failed or was cancelled."
+  error:    String
+  status:   StitchStatus
+}
+
+type StitchResult {
+  width:  Int!
+  height: Int!
+  bytes:  Int!
+}
+
+enum StitchStatus {
+  PROGRESS
+  COMPLETED
+  CANCELLED
+  FAILED
+}

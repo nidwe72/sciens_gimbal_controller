@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>at.sciens</groupId>
+    <artifactId>panostitch-renderer</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Panostitch renderer</name>
+    <description>
+        In-process GraphQL stitch server for the gimbal-controller (panoramique)
+        app. Forked from petzvalStudio's petzval-renderer, stripped to the
+        transport core: Javalin + graphql-java + a single `stitch` op. The
+        actual stitch is delegated to an injected StitchEngine (the Android app
+        supplies a Chaquopy/Python implementation) — this jar has NO JavaCV and
+        no native dependencies.
+    </description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>17</maven.compiler.release>
+
+        <javalin.version>6.3.0</javalin.version>
+        <graphql.java.version>22.3</graphql.java.version>
+        <jackson.version>2.18.0</jackson.version>
+        <slf4j.version>2.0.16</slf4j.version>
+        <reactive.streams.version>1.0.4</reactive.streams.version>
+    </properties>
+
+    <dependencies>
+        <!-- Embedded HTTP server (Jetty under the hood). -->
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+            <version>${javalin.version}</version>
+        </dependency>
+
+        <!-- GraphQL engine. -->
+        <dependency>
+            <groupId>com.graphql-java</groupId>
+            <artifactId>graphql-java</artifactId>
+            <version>${graphql.java.version}</version>
+        </dependency>
+
+        <!-- graphql-java Subscription resolvers return org.reactivestreams.Publisher. -->
+        <dependency>
+            <groupId>org.reactivestreams</groupId>
+            <artifactId>reactive-streams</artifactId>
+            <version>${reactive.streams.version}</version>
+        </dependency>
+
+        <!-- JSON for the HTTP/WS message bodies. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!-- Logging. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Thin jar (just our classes). The Android Gradle build pulls the
+             heavy deps (Javalin, graphql-java, jackson, slf4j) from Maven
+             Central itself, mirroring petzvalStudio's android packaging. -->
+        <finalName>panostitch-renderer</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>17</release>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

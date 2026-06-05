@@ -4898,6 +4898,85 @@ pending — needs hardware).
 - Persisting / exporting the preview pano (view-only for now; export
   could tie into the Phase 5 hand-off later).
 
+## Phase 7 — Affine stitch (Python / Chaquopy server)
+
+A **third `StitchMode`** (`affine`) alongside `geometric` and `openpano`.
+Geometric and OpenPano are unchanged; affine is the path we intend to
+eventually replace OpenPano with. It runs the Python
+[`stitching`](https://pypi.org/project/stitching/) library's
+`AffineStitcher` (a thin wrapper over OpenCV's `stitching_detailed`) which —
+evaluated against the demo crops — reconstructs the source far better than
+OpenPano (16/16 tiles, output ≈ the original frame). It is the correct model
+for the demo tiles, which are translation/scale-related crops of one flat
+asset (no perspective).
+
+**Architecture (adopted from the sibling `petzvalStudio` project).** Flutter
+talks to an **in-process backend** over localhost HTTP/GraphQL, exactly as
+petzvalStudio does — *Android-only for now*, but the GraphQL pattern is kept
+so other targets can follow with one design.
+
+```
+Flutter (Dart)                Java (in-process)            Python (Chaquopy)
+─────────────                 ─────────────────            ─────────────────
+AffineServerStitcher          panostitch-renderer.jar      stitch_worker.py
+  POST /upload  (tiles)  ──▶   Javalin + graphql-java   ──▶  AffineStitcher
+  mutation stitch        ──▶   StitchService (1-flight)      (sift, crop=False)
+  WS stitchEvents (progress)◀─ ProgressReporter        ◀──  progress.report()
+  GET /result/{id}       ──▶   StitchEngine (injected)
+```
+
+- **Backend jar** — `java/panostitch-renderer/` (Maven, package
+  `at.sciens.panostitch`), a **fork** of petzvalStudio's `petzval-renderer`
+  stripped to the transport core: `Main` (Javalin boot), `GraphQLEndpoint`,
+  `GraphQLWsHandler` (graphql-transport-ws), `StitchService` (single-flight
+  worker + `SubmissionPublisher` event channel), `ProgressReporter`. **No
+  JavaCV** — the jar has no image stack; it delegates the stitch to an
+  injected `StitchEngine`. Built with `mvn package` → thin
+  `android/app/libs/panostitch-renderer.jar`; the heavy deps (Javalin 6.3.0,
+  graphql-java 22.3, jackson, reactive-streams, slf4j) come via Gradle.
+- **GraphQL surface** — `stitch(uploadIds:[ID!]!, nCols:Int): ID!` mutation,
+  `stitchEvents(stitchId:ID!): StitchEvent!` subscription, `cancel`. Image
+  bytes go out-of-band: tiles up via `POST /upload` (one per call), the
+  panorama PNG down via `GET /result/{stitchId}`.
+- **Boot** — `BackendChannel.java` starts Chaquopy + `Main.start(0, engine)`
+  in-process at app launch (eager — "boot at app start") on `127.0.0.1`, and
+  hands the OS-assigned port to Dart over the
+  `at.sciens.gimbal_controller/backend` MethodChannel (`getBackendPort`).
+- **StitchEngine** — `ChaquopyStitchEngine` (in the app, where Chaquopy's API
+  is visible) calls the Python worker via Chaquopy. It passes tile paths as a
+  Java `String[]` (Chaquopy maps arrays to an iterable `jarray`; Java
+  collections are *not* iterable from Python) and a `PyProgress` adapter
+  (a public class wrapping the `ProgressReporter` lambda).
+- **Python worker** — `android/app/src/main/python/stitch_worker.py` walks
+  the `Stitcher` pipeline step-by-step (mirrors `stitching.Stitcher.stitch`)
+  so it can emit a monotonic progress fraction between phases
+  (features 0.35 / matching 0.45 / geometry 0.60 / seams 0.70 / warp 0.85 /
+  blend 0.98 / 1.0). `stitching` is **vendored** alongside it (pure Python);
+  `numpy` + `opencv-python==4.5.1.48` come from Chaquopy's pip. `crop=False`
+  keeps `largestinteriorrectangle` (numba — no Android wheel) out of the
+  import path.
+- **Dart client** — `lib/panorama/affine_server_stitcher.dart` mirrors
+  `PanoStitcher`'s `stitch(...) → StitchResult` shape, so the controller
+  branch and the existing progress UI are unchanged. The `stitchEvents` WS
+  subscription drives the progress bar; `GET /result` (which blocks until
+  done) delivers the bytes.
+
+**Packaging deltas (real costs of the affine mode).**
+- **`minSdk` 21 → 26** — cv2's wheel needs API 24, Jetty 11 (Javalin's
+  server) needs API 26; the floor is 26.
+- **`isCoreLibraryDesugaringEnabled = true` + `multiDexEnabled = true`** —
+  required, or Jetty/graphql-java fail to dex (matches petzvalStudio).
+- **APK ≈ +90 MB** — CPython 3.10 + numpy + cv2 (+ openblas/libjpeg/…) ≈
+  60 MB, plus Jetty + graphql-java.
+
+**Verification (2026-06-05).** Eval harness (outside the app) confirmed the
+affine recipe; the Chaquopy packaging + on-device run were proven with a
+standalone spike; `flutter build apk` packages the whole chain; the affine
+StitchMode produces the panorama on a real arm64 device.
+
+**Roadmap note.** OpenPano (`openpano` mode + its C++/JNI) stays for now and
+is slated for removal once affine is proven in the field.
+
 ## Out of scope (entire project)
 
 - iOS / desktop / web targets.

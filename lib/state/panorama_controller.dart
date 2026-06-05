@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import '../camera/camera_connection.dart';
+import '../panorama/affine_server_stitcher.dart';
 import '../panorama/geometric_stitcher.dart';
 import '../panorama/panorama_grid.dart';
 import '../panorama/pano_stitcher.dart';
@@ -20,6 +21,9 @@ enum StitchMode {
 
   /// OpenPano feature-stitch (corrects alignment, but spherical/slow).
   openpano,
+
+  /// Affine feature-stitch via the in-process Python server (Chaquopy).
+  affine,
 }
 
 /// Overall run state. `done | cancelled | aborted` are terminal.
@@ -91,6 +95,7 @@ class PanoramaController extends ChangeNotifier {
 
   // --- Stitch-preview state (Phase 6 enhancement).
   final PanoStitcher _stitcher = PanoStitcher();
+  final AffineServerStitcher _affineStitcher = AffineServerStitcher();
 
   /// Selected assembly mode (GUI-selectable). Default = geometric.
   StitchMode _stitchMode = StitchMode.geometric;
@@ -362,17 +367,19 @@ class PanoramaController extends ChangeNotifier {
       }
     } else {
       final ordered = _orderedTiles();
-      final result = await _stitcher.stitch(
-        ordered,
-        nCols: _grid.nCols,
-        onStage: (s, p) {
-          if (gen == _stitchGen) {
-            _stitchStage = s;
-            _stitchProgress = p;
-            notifyListeners();
-          }
-        },
-      );
+      void onStage(String s, double? p) {
+        if (gen == _stitchGen) {
+          _stitchStage = s;
+          _stitchProgress = p;
+          notifyListeners();
+        }
+      }
+
+      // affine → in-process Python server; openpano → native JNI.
+      final result = _stitchMode == StitchMode.affine
+          ? await _affineStitcher.stitch(ordered,
+              nCols: _grid.nCols, onStage: onStage)
+          : await _stitcher.stitch(ordered, nCols: _grid.nCols, onStage: onStage);
       image = result.image;
       error = result.ok ? null : result.error;
     }
