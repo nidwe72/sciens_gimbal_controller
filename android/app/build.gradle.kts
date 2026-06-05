@@ -91,14 +91,9 @@ chaquopy {
 }
 
 dependencies {
-    // The forked in-process stitch server (thin jar; heavy deps pulled below).
-    implementation(files("libs/panostitch-renderer.jar"))
-    // Embedded HTTP + GraphQL — same versions the renderer jar compiled against.
-    implementation("io.javalin:javalin:6.3.0")
-    implementation("com.graphql-java:graphql-java:22.3")
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
-    implementation("org.reactivestreams:reactive-streams:1.0.4")
-    implementation("org.slf4j:slf4j-simple:2.0.16")
+    // The in-process stitch server, built from source (Javalin + graphql-java
+    // + jackson + slf4j come transitively as its `api` deps).
+    implementation(project(":panostitch-renderer"))
     // Required by isCoreLibraryDesugaringEnabled = true.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 }

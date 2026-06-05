@@ -27,3 +27,8 @@ plugins {
 }
 
 include(":app")
+
+// The stitch renderer, built from source (no committed jar). Its dir lives at
+// the project root under java/, outside this Android Gradle root.
+include(":panostitch-renderer")
+project(":panostitch-renderer").projectDir = file("../java/panostitch-renderer")

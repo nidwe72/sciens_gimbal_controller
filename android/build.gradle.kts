@@ -16,7 +16,12 @@ subprojects {
     project.layout.buildDirectory.value(newSubprojectBuildDir)
 }
 subprojects {
-    project.evaluationDependsOn(":app")
+    // :panostitch-renderer is a plain java-library that :app depends ON, so it
+    // must NOT be forced to evaluate after :app (that's a Flutter-plugin
+    // ordering rule, and would invert this dependency).
+    if (project.name != "panostitch-renderer") {
+        project.evaluationDependsOn(":app")
+    }
 }
 
 tasks.register<Delete>("clean") {
