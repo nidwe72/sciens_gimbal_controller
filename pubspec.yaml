@@ -40,6 +40,7 @@ dependencies:
   flutter_svg: ^2.0.10
   http: ^1.2.0
   permission_handler: ^12.0.1
+  path_provider: ^2.1.0
   vector_math: ^2.2.0
   xml: ^6.5.0
 

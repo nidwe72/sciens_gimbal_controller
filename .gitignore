@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Phase 6 native-stitch third-party trees — NOT vendored. Reconstructed
+# by scripts/fetch-stitch-deps.sh (OpenPano pinned + cpp/openpano.patch;
+# Eigen pinned). See the script header.
+/android/app/src/main/cpp/openpano/
+/android/app/src/main/cpp/eigen/
