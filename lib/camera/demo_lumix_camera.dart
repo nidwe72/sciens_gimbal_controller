@@ -321,6 +321,11 @@ class DemoLumixCamera implements CameraTransport {
     if (!_previewFramesCtrl.isClosed) await _previewFramesCtrl.close();
   }
 
+  /// The bundled captured still's bytes — the panorama's per-tile demo
+  /// path slices this in memory into the grid mosaic (SPEC Phase 4
+  /// "Per-tile tile images"). Cached after the first load.
+  Future<Uint8List> capturedStillBytes() => _loadAsset(_imageAsset);
+
   /// Load and cache a bundled asset's bytes.
   Future<Uint8List> _loadAsset(String path) async {
     final cached = _assetCache[path];

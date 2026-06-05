@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
+import '../panorama/pano_tile_image.dart';
 import 'camera_transport.dart';
 import 'capture_sounds.dart';
 import 'demo_lumix_camera.dart';
@@ -86,6 +87,15 @@ class CameraConnection extends ChangeNotifier {
   String? _lastFullImageUrl;
   final _capturedImage = ValueNotifier<ui.Image?>(null);
   bool _fetchInProgress = false;
+
+  // Panorama per-tile thumbnail state (Phase 4 revision). The demo
+  // asset is decoded once and shared across all demo tiles; the live
+  // path tracks the last fetched item id as a freshness guard so a
+  // lagging SD index can't mis-fill later cells.
+  ui.Image? _demoTileAsset;
+  int? _lastPanoTileId;
+  static const int _panoFetchRetries = 4;
+  static const Duration _panoFetchRetryDelay = Duration(milliseconds: 250);
 
   // Capture-delay state (PR 10).
   final ValueNotifier<int?> _countdownSecondsLeft = ValueNotifier(null);
@@ -691,6 +701,96 @@ class CameraConnection extends ChangeNotifier {
     return result;
   }
 
+  /// Reset the panorama per-tile fetch state. Called by the sequencer
+  /// at the start of each run so the freshness guard's id baseline
+  /// doesn't carry over between runs.
+  void resetPanoFetch() => _lastPanoTileId = null;
+
+  /// Produce the image for one panorama tile (SPEC Phase 4 "Per-tile
+  /// tile images"). Mode-agnostic to the caller — the demo/live branch
+  /// lives here:
+  ///
+  /// - **Demo**: crop the bundled asset (decoded once, shared) to the
+  ///   tile's **fractional window** (`srcFrac*`, from the grid math) —
+  ///   overlapping windows so the stitcher has correspondences. No
+  ///   transport, no `recMode`.
+  /// - **Live**: fetch the SM thumbnail of the just-taken frame, with a
+  ///   strictly-increasing-id freshness guard (brief retry), then
+  ///   **await** the `recMode` restore so the next `capture()` lands in
+  ///   record mode. Isolated from [capturedImage]. (The `srcFrac*` args
+  ///   are ignored on the live path.)
+  ///
+  /// Returns null on failure; the caller treats null as a hard abort.
+  Future<PanoTileImage?> fetchPanoTile({
+    required double srcFracLeft,
+    required double srcFracTop,
+    required double srcFracWidth,
+    required double srcFracHeight,
+  }) async {
+    final demo = demoCamera;
+    if (demo != null) {
+      try {
+        final asset = _demoTileAsset ??=
+            await decodeJpeg(await demo.capturedStillBytes());
+        final aw = asset.width.toDouble();
+        final ah = asset.height.toDouble();
+        // Map the normalised window onto the asset, clamped to bounds.
+        final left = (srcFracLeft * aw).clamp(0.0, aw);
+        final top = (srcFracTop * ah).clamp(0.0, ah);
+        final right = ((srcFracLeft + srcFracWidth) * aw).clamp(left, aw);
+        final bottom = ((srcFracTop + srcFracHeight) * ah).clamp(top, ah);
+        final src = ui.Rect.fromLTRB(left, top, right, bottom);
+        return PanoTileImage(image: asset, src: src, ownsImage: false);
+      } catch (_) {
+        return null;
+      }
+    }
+    return _fetchLivePanoTile();
+  }
+
+  Future<PanoTileImage?> _fetchLivePanoTile() async {
+    final content = _content;
+    final camera = _camera;
+    if (content == null || camera == null) return null;
+    _fetchInProgress = true;
+    notifyListeners();
+    try {
+      // Freshness guard: the new shot's id must strictly exceed the
+      // previous tile's. SD indexing can lag the isBusy→idle signal, so
+      // retry briefly before giving up.
+      ContentImage? fresh;
+      for (var attempt = 0; attempt < _panoFetchRetries; attempt++) {
+        final item = await content.fetchLatest();
+        final id = item == null ? null : int.tryParse(item.id);
+        if (item != null &&
+            id != null &&
+            (_lastPanoTileId == null || id > _lastPanoTileId!)) {
+          _lastPanoTileId = id;
+          fresh = item;
+          break;
+        }
+        await Future<void>.delayed(_panoFetchRetryDelay);
+      }
+      if (fresh == null) return null; // never advanced → caller aborts.
+      final smUrl = fresh.mediumUrl ?? fresh.fullUrl;
+      if (smUrl == null) return null;
+      final image =
+          await decodeJpeg(await camera.rawGetBytes(smUrl), targetWidth: 480);
+      return PanoTileImage(
+        image: image,
+        src: ui.Rect.fromLTWH(
+            0, 0, image.width.toDouble(), image.height.toDouble()),
+        ownsImage: true,
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      // Always restore record mode (awaited) — even on the failure path
+      // — so the camera is left sane for the next capture / abort.
+      await _restoreAfterContentAccess(camera);
+    }
+  }
+
   /// Recover the camera after touching the DLNA content server.
   /// Browsing / downloading silently flips the camera into playback
   /// mode, which drops both the shutter (`camcmd capture` is accepted
@@ -823,6 +923,10 @@ class CameraConnection extends ChangeNotifier {
     _lastFullImageUrl = null;
     _capturedImage.value?.dispose();
     _capturedImage.value = null;
+    // NB: don't dispose _demoTileAsset here — the pano grid may still be
+    // painting tiles that reference the shared asset image. It's cached
+    // for the connection's lifetime and freed in dispose().
+    _lastPanoTileId = null;
     _setStatus(CameraStatus.disconnected, 'Disconnected');
   }
 
@@ -843,6 +947,8 @@ class CameraConnection extends ChangeNotifier {
     _lastFullImageUrl = null;
     _capturedImage.value?.dispose();
     _capturedImage.value = null;
+    // See disconnect(): the shared demo asset outlives a disconnect.
+    _lastPanoTileId = null;
     _errorText = message;
     _setStatus(CameraStatus.error, 'Disconnected');
   }
@@ -862,6 +968,8 @@ class CameraConnection extends ChangeNotifier {
     _previewImage.dispose();
     _capturedImage.value?.dispose();
     _capturedImage.dispose();
+    _demoTileAsset?.dispose();
+    _demoTileAsset = null;
     _camera?.disconnect(streaming: _previewActive);
     // PR 10 capture-delay teardown.
     _countdownTimer?.cancel();

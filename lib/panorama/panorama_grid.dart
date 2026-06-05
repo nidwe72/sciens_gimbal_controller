@@ -38,12 +38,24 @@ int _tileCount(double span, double tile, double step) {
 /// One tile's absolute target plus its grid position. [index] is the
 /// serpentine visit order; [row]/[col] are the grid coordinates (for
 /// the UI cells).
+///
+/// [srcFracLeft]/[srcFracTop]/[srcFracWidth]/[srcFracHeight] describe
+/// this tile's window **as a fraction of the stitched-FOV frame**,
+/// symmetric about the centre. The Phase 6 demo path maps these onto the
+/// bundled asset to produce **overlapping** source crops (adjacent tiles
+/// share `overlap` of their extent), so the stitcher has real
+/// correspondences. Values can fall slightly outside `[0, 1]` for edge
+/// tiles — consumers clamp to the asset bounds.
 class TilePosition {
   final double yawDeg;
   final double pitchDeg;
   final int row;
   final int col;
   final int index;
+  final double srcFracLeft;
+  final double srcFracTop;
+  final double srcFracWidth;
+  final double srcFracHeight;
 
   const TilePosition({
     required this.yawDeg,
@@ -51,6 +63,10 @@ class TilePosition {
     required this.row,
     required this.col,
     required this.index,
+    required this.srcFracLeft,
+    required this.srcFracTop,
+    required this.srcFracWidth,
+    required this.srcFracHeight,
   });
 }
 
@@ -133,6 +149,19 @@ PanoramaGrid computePanoramaGrid({
   double yawForCol(int c) => centreYaw + (c - (nCols - 1) / 2.0) * stepH;
   double pitchForRow(int r) => centrePitch + (r - (nRows - 1) / 2.0) * stepV;
 
+  // Per-tile window as a fraction of the demo asset (Phase 6 demo
+  // source). The asset maps to the grid's **total angular coverage**
+  // (`(n−1)·step + tile`), NOT the stitched FOV — otherwise edge tiles
+  // run off the asset and clamp to slivers. With this, the grid fills
+  // `[0,1]` exactly: every tile is a full `tile`-sized window, and
+  // adjacent tiles overlap by `overlap` (because step = tile·(1−overlap)).
+  final totalCoverH = (nCols - 1) * stepH + tileH;
+  final totalCoverV = (nRows - 1) * stepV + tileV;
+  final fracW = tileH / totalCoverH;
+  final fracH = tileV / totalCoverV;
+  double fracLeftForCol(int c) => c * stepH / totalCoverH;
+  double fracTopForRow(int r) => r * stepV / totalCoverV;
+
   final tiles = <TilePosition>[];
   var index = 0;
   for (var r = 0; r < nRows; r++) {
@@ -148,6 +177,10 @@ PanoramaGrid computePanoramaGrid({
         row: r,
         col: c,
         index: index++,
+        srcFracLeft: fracLeftForCol(c),
+        srcFracTop: fracTopForRow(r),
+        srcFracWidth: fracW,
+        srcFracHeight: fracH,
       ));
     }
   }
