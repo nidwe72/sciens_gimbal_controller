@@ -10,6 +10,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import '../../camera/camera_connection.dart';
 import '../../camera/lumix_protocol.dart';
 import '../../state/panorama_controller.dart';
+import '../full_screen_image.dart';
 import 'camera_diagnostics_view.dart';
 import 'pano_tab.dart';
 
@@ -93,16 +94,19 @@ class _CameraTabState extends ConsumerState<CameraTab>
     final isDemo = ref.watch(
         cameraConnectionProvider.select((c) => c.isDemo));
     final conn = ref.read(cameraConnectionProvider);
-    // Block sub-tab switching while a panorama run is active (the run
-    // lives in the Pano sub-tab; navigating away mid-run is disallowed).
+    // Block sub-tab switching while a panorama run OR a stitch is active
+    // (both live in the Pano sub-tab; navigating away is disallowed).
     final panoRunning =
         ref.watch(panoramaControllerProvider.select((c) => c.running));
+    final stitching =
+        ref.watch(panoramaControllerProvider.select((c) => c.stitching));
+    final locked = panoRunning || stitching;
     final tabsBody = DefaultTabController(
       length: isDemo ? 4 : 3,
       child: Column(
         children: [
           IgnorePointer(
-            ignoring: panoRunning,
+            ignoring: locked,
             child: TabBar(
               tabs: [
                 const Tab(text: 'Capture'),
@@ -114,7 +118,7 @@ class _CameraTabState extends ConsumerState<CameraTab>
           ),
           Expanded(
             child: TabBarView(
-              physics: panoRunning
+              physics: locked
                   ? const NeverScrollableScrollPhysics()
                   : null,
               children: [
@@ -139,9 +143,73 @@ class _CameraTabState extends ConsumerState<CameraTab>
             tabsBody,
             if (overlayActive)
               Positioned.fill(child: _CaptureOverlay(conn: conn)),
+            if (stitching) const Positioned.fill(child: _StitchOverlay()),
           ],
         );
       },
+    );
+  }
+}
+
+/// Progress overlay shown while a panorama is stitching (Phase 6). Mirrors
+/// [_CaptureOverlay]: a full-fill scrim that absorbs taps, an indeterminate
+/// spinner + stage label, and a Cancel button (soft-cancel). The stitch is
+/// a single opaque native call, so progress is indeterminate.
+class _StitchOverlay extends ConsumerWidget {
+  const _StitchOverlay();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final stage = ref.watch(
+        panoramaControllerProvider.select((c) => c.stitchStage));
+    final progress = ref.watch(
+        panoramaControllerProvider.select((c) => c.stitchProgress));
+    return ColoredBox(
+      color: Colors.black.withValues(alpha: 0.5),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {},
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 72,
+                height: 72,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    SizedBox.expand(
+                      child: CircularProgressIndicator(
+                        strokeWidth: 6,
+                        value: progress, // null → indeterminate
+                      ),
+                    ),
+                    if (progress != null)
+                      Text('${(progress * 100).round()}%',
+                          style: theme.textTheme.labelLarge
+                              ?.copyWith(color: Colors.white)),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                stage ?? 'Stitching…',
+                style: theme.textTheme.titleMedium
+                    ?.copyWith(color: Colors.white),
+              ),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: () =>
+                    ref.read(panoramaControllerProvider).cancelStitch(),
+                style: TextButton.styleFrom(foregroundColor: Colors.white),
+                child: const Text('Cancel'),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -863,7 +931,7 @@ class _CameraPaneState extends State<_CameraPane> {
   void _openFullScreen() {
     Navigator.of(context).push(MaterialPageRoute<void>(
       fullscreenDialog: true,
-      builder: (_) => _FullScreenImage(conn: widget.conn),
+      builder: (_) => FullScreenImage(loader: () => widget.conn.fetchFullImage()),
     ));
   }
 
@@ -911,95 +979,6 @@ class _CameraPaneState extends State<_CameraPane> {
           alignment: Alignment.center,
           child: content,
         ),
-      ),
-    );
-  }
-}
-
-/// Full-screen viewer for the captured image — fetches the full-res
-/// JPEG and shows it edge-to-edge in a pinch-zoomable
-/// `InteractiveViewer`. Hides the system bars while open so the image
-/// uses the whole screen, in either orientation.
-class _FullScreenImage extends StatefulWidget {
-  const _FullScreenImage({required this.conn});
-
-  final CameraConnection conn;
-
-  @override
-  State<_FullScreenImage> createState() => _FullScreenImageState();
-}
-
-class _FullScreenImageState extends State<_FullScreenImage> {
-  ui.Image? _image;
-  bool _failed = false;
-
-  @override
-  void initState() {
-    super.initState();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    _load();
-  }
-
-  Future<void> _load() async {
-    final image = await widget.conn.fetchFullImage();
-    if (!mounted) {
-      image?.dispose();
-      return;
-    }
-    setState(() {
-      _image = image;
-      _failed = image == null;
-    });
-  }
-
-  @override
-  void dispose() {
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    _image?.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final image = _image;
-    final Widget content;
-    if (image != null) {
-      content = InteractiveViewer(
-        maxScale: 6,
-        child: RawImage(image: image, fit: BoxFit.contain),
-      );
-    } else if (_failed) {
-      content = const Center(
-        child: Text('Could not load the image.',
-            style: TextStyle(color: Colors.white70)),
-      );
-    } else {
-      content = const Center(child: CircularProgressIndicator());
-    }
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          Positioned.fill(child: content),
-          Positioned(
-            top: 0,
-            left: 0,
-            child: SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: Material(
-                  color: Colors.black54,
-                  shape: const CircleBorder(),
-                  clipBehavior: Clip.antiAlias,
-                  child: IconButton(
-                    icon: const Icon(Icons.close, color: Colors.white),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
       ),
     );
   }

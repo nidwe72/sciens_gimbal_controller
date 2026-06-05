@@ -107,9 +107,10 @@ class _PlaygroundScreenState extends ConsumerState<PlaygroundScreen> {
         ),
         bottomNavigationBar: NavigationBar(
           selectedIndex: _selectedIndex,
-          // Block top-level tab switching while a panorama run is active.
-          onDestinationSelected: ref
-                  .watch(panoramaControllerProvider.select((c) => c.running))
+          // Block top-level tab switching while a panorama run or stitch
+          // is active.
+          onDestinationSelected: ref.watch(panoramaControllerProvider
+                  .select((c) => c.running || c.stitching))
               ? null
               : (i) => setState(() => _selectedIndex = i),
           destinations: const [

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:feiyu_gimbal/feiyu_gimbal.dart';
 import 'package:flutter/foundation.dart';
@@ -6,8 +7,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import '../camera/camera_connection.dart';
+import '../panorama/geometric_stitcher.dart';
 import '../panorama/panorama_grid.dart';
+import '../panorama/pano_stitcher.dart';
+import '../panorama/pano_tile_image.dart';
 import 'gimbal_connection.dart';
+
+/// How the preview panorama is assembled.
+enum StitchMode {
+  /// Paste tiles at their known grid positions (flat, instant). Default.
+  geometric,
+
+  /// OpenPano feature-stitch (corrects alignment, but spherical/slow).
+  openpano,
+}
 
 /// Overall run state. `done | cancelled | aborted` are terminal.
 enum PanoState { idle, running, cancelling, done, cancelled, aborted }
@@ -62,6 +75,12 @@ class PanoramaController extends ChangeNotifier {
   List<TileState> _tileStates = const [];
   List<TileState> get tileStates => List.unmodifiable(_tileStates);
 
+  /// Per-tile thumbnail/crop, indexed by `TilePosition.index`. Null
+  /// until that tile is shot. Demo tiles share one asset image (not
+  /// owned); live tiles each own their SM thumbnail.
+  List<PanoTileImage?> _tileImages = const [];
+  List<PanoTileImage?> get tileImages => List.unmodifiable(_tileImages);
+
   int _currentIndex = -1;
   int get currentIndex => _currentIndex;
 
@@ -69,6 +88,48 @@ class PanoramaController extends ChangeNotifier {
   String? get message => _message;
 
   bool _cancelRequested = false;
+
+  // --- Stitch-preview state (Phase 6 enhancement).
+  final PanoStitcher _stitcher = PanoStitcher();
+
+  /// Selected assembly mode (GUI-selectable). Default = geometric.
+  StitchMode _stitchMode = StitchMode.geometric;
+  StitchMode get stitchMode => _stitchMode;
+  void setStitchMode(StitchMode mode) {
+    if (_stitchMode == mode || _stitching) return;
+    _stitchMode = mode;
+    notifyListeners();
+  }
+
+  bool _stitching = false;
+  bool get stitching => _stitching;
+
+  /// Coarse stage label shown in the progress overlay while stitching.
+  String? _stitchStage;
+  String? get stitchStage => _stitchStage;
+
+  /// Stitch progress 0–1 (determinate ring), or null for indeterminate.
+  double? _stitchProgress;
+  double? get stitchProgress => _stitchProgress;
+
+  /// Cached stitched panorama (in memory, invalidated by a new run).
+  ui.Image? _stitchedPano;
+  ui.Image? get stitchedPano => _stitchedPano;
+  bool get hasStitchedPano => _stitchedPano != null;
+
+  String? _stitchError;
+  String? get stitchError => _stitchError;
+
+  /// Generation counter for soft-cancel: a stitch whose generation has
+  /// been superseded (by Cancel or a new run) discards its result.
+  int _stitchGen = 0;
+
+  /// Whether "Stitch pano" may run now: a completed run, ≥2 tiles, and
+  /// not already stitching.
+  bool get canStitch =>
+      _state == PanoState.done &&
+      !_stitching &&
+      _tileImages.where((t) => t != null).length >= 2;
 
   /// Update one or more settings (no-op while a run is active). Recomputes
   /// the preview grid.
@@ -98,7 +159,18 @@ class PanoramaController extends ChangeNotifier {
     );
     // Drop stale per-tile progress from any previous run; start() refills.
     _tileStates = const [];
+    _disposeTileImages();
     notifyListeners();
+  }
+
+  /// Dispose owned (live) tile images and clear the list. The demo's
+  /// shared asset is owned by CameraConnection, so its tiles
+  /// (`ownsImage == false`) are left alone.
+  void _disposeTileImages() {
+    for (final t in _tileImages) {
+      if (t != null && t.ownsImage) t.image.dispose();
+    }
+    _tileImages = const [];
   }
 
   /// Whether Take may start right now (math gate + both devices
@@ -128,6 +200,9 @@ class PanoramaController extends ChangeNotifier {
     // Rebuild the grid anchored at the captured centre.
     _recompute(centreYaw: centreYaw, centrePitch: centrePitch);
     _tileStates = List<TileState>.filled(_grid.totalShots, TileState.pending);
+    _tileImages = List<PanoTileImage?>.filled(_grid.totalShots, null);
+    _clearStitchedPano(); // "Take panorama" invalidates the cached preview
+    camera.resetPanoFetch();
     _cancelRequested = false;
     _currentIndex = -1;
     _message = null;
@@ -139,8 +214,16 @@ class PanoramaController extends ChangeNotifier {
 
     for (final tile in _grid.tiles) {
       if (_cancelRequested) break;
-      if (!gimbal.isConnected || !camera.isConnected) {
-        _finish(PanoState.aborted, 'Device disconnected mid-run');
+      // Gimbal link down → can't drive home, leave in place. Camera link
+      // down → gimbal healthy, so return to centre (see SPEC return-to-
+      // centre rule).
+      if (!gimbal.isConnected) {
+        _finish(PanoState.aborted, 'Gimbal disconnected mid-run');
+        return;
+      }
+      if (!camera.isConnected) {
+        await _returnToCentre(gimbal, centreYaw, centrePitch);
+        _finish(PanoState.aborted, 'Camera disconnected mid-run');
         return;
       }
 
@@ -163,18 +246,38 @@ class PanoramaController extends ChangeNotifier {
       await Future<void>.delayed(Duration(seconds: _settleSeconds));
       if (_cancelRequested) break;
       if (!camera.isConnected) {
+        await _returnToCentre(gimbal, centreYaw, centrePitch);
         _finish(PanoState.aborted, 'Camera disconnected before capture');
         return;
       }
 
       final err = await camera.capture();
       if (err != null) {
+        // Camera-side failure, gimbal healthy → return to centre.
         _setTile(tile.index, TileState.failed);
+        await _returnToCentre(gimbal, centreYaw, centrePitch);
         _finish(PanoState.aborted, 'Capture failed at tile ${tile.index}: $err');
         return;
       }
 
       await _awaitShotComplete(camera);
+
+      // Mandatory per-tile image (demo crop / live SM thumbnail). A
+      // failure here aborts the whole run — there is no thumbnail-less
+      // "taken" state. Camera-side failure → return to centre.
+      final tileImage = await camera.fetchPanoTile(
+        srcFracLeft: tile.srcFracLeft,
+        srcFracTop: tile.srcFracTop,
+        srcFracWidth: tile.srcFracWidth,
+        srcFracHeight: tile.srcFracHeight,
+      );
+      if (tileImage == null) {
+        _setTile(tile.index, TileState.failed);
+        await _returnToCentre(gimbal, centreYaw, centrePitch);
+        _finish(PanoState.aborted, 'Image fetch failed at tile ${tile.index}');
+        return;
+      }
+      _setTileImage(tile.index, tileImage);
       _setTile(tile.index, TileState.taken);
     }
 
@@ -224,6 +327,121 @@ class PanoramaController extends ChangeNotifier {
     if (index < 0 || index >= _tileStates.length) return;
     _tileStates[index] = s;
     notifyListeners();
+  }
+
+  void _setTileImage(int index, PanoTileImage image) {
+    if (index < 0 || index >= _tileImages.length) return;
+    _tileImages[index] = image;
+    notifyListeners();
+  }
+
+  // --- Stitch preview (Phase 6).
+
+  /// Assemble the captured tiles into a preview panorama (via the
+  /// selected [stitchMode]) and cache it. No-op unless [canStitch].
+  /// Soft-cancellable via [cancelStitch].
+  Future<void> stitchPano() async {
+    if (!canStitch) return;
+
+    final gen = ++_stitchGen;
+    _stitching = true;
+    _stitchError = null;
+    _stitchProgress = null;
+    _stitchStage =
+        _stitchMode == StitchMode.geometric ? 'Placing tiles…' : 'Preparing tiles…';
+    notifyListeners();
+
+    ui.Image? image;
+    String? error;
+    if (_stitchMode == StitchMode.geometric) {
+      // Flat, deterministic, near-instant — no native call.
+      try {
+        image = await geometricStitch(_grid, _tileImages);
+      } catch (e) {
+        error = '$e';
+      }
+    } else {
+      final ordered = _orderedTiles();
+      final result = await _stitcher.stitch(
+        ordered,
+        nCols: _grid.nCols,
+        onStage: (s, p) {
+          if (gen == _stitchGen) {
+            _stitchStage = s;
+            _stitchProgress = p;
+            notifyListeners();
+          }
+        },
+      );
+      image = result.image;
+      error = result.ok ? null : result.error;
+    }
+
+    // Superseded by Cancel or a new run → discard this result.
+    if (gen != _stitchGen) {
+      image?.dispose();
+      return;
+    }
+
+    _stitching = false;
+    _stitchStage = null;
+    _stitchProgress = null;
+    if (image != null) {
+      _stitchedPano?.dispose();
+      _stitchedPano = image;
+    } else {
+      _stitchError = error ?? 'Stitch failed.';
+    }
+    notifyListeners();
+  }
+
+  /// Soft-cancel an in-flight stitch: the overlay closes immediately; the
+  /// orphaned native call finishes in the background and its result is
+  /// dropped (the generation no longer matches).
+  void cancelStitch() {
+    if (!_stitching) return;
+    _stitchGen++;
+    _stitching = false;
+    _stitchStage = null;
+    _stitchProgress = null;
+    notifyListeners();
+  }
+
+  /// Tiles in spatial row-major order (the stitcher's preferred input).
+  List<PanoTileImage> _orderedTiles() {
+    final indexByRowCol = <int, int>{};
+    for (final t in _grid.tiles) {
+      indexByRowCol[t.row * _grid.nCols + t.col] = t.index;
+    }
+    final ordered = <PanoTileImage>[];
+    for (var r = 0; r < _grid.nRows; r++) {
+      for (var c = 0; c < _grid.nCols; c++) {
+        final idx = indexByRowCol[r * _grid.nCols + c];
+        if (idx != null && idx < _tileImages.length && _tileImages[idx] != null) {
+          ordered.add(_tileImages[idx]!);
+        }
+      }
+    }
+    return ordered;
+  }
+
+  /// Drop the cached pano and supersede any in-flight stitch. Called when
+  /// a new run starts ("Take panorama" is the sole cache invalidator).
+  void _clearStitchedPano() {
+    _stitchGen++;
+    _stitching = false;
+    _stitchStage = null;
+    _stitchProgress = null;
+    _stitchError = null;
+    _stitchedPano?.dispose();
+    _stitchedPano = null;
+  }
+
+  @override
+  void dispose() {
+    _disposeTileImages();
+    _stitchedPano?.dispose();
+    super.dispose();
   }
 
   void _finish(PanoState terminal, String message) {

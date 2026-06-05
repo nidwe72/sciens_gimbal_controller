@@ -1,10 +1,14 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../camera/camera_connection.dart';
 import '../../panorama/panorama_grid.dart';
+import '../../panorama/pano_tile_image.dart';
 import '../../state/gimbal_connection.dart';
 import '../../state/panorama_controller.dart';
+import '../full_screen_image.dart';
 
 /// The 'Pano' sub-tab inside the Camera tab. Brenizer inputs + a live
 /// tile grid + Take/Cancel, wired to [PanoramaController]. See
@@ -41,6 +45,49 @@ class _PanoTabState extends ConsumerState<PanoTab>
             gimbalConnected: gimbalConnected,
             cameraConnected: cameraConnected,
           ),
+        // Take / Cancel are the first controls (SPEC Phase 4: buttons-
+        // first layout) so the primary actions are reachable without
+        // scrolling past the parameters.
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: pano.canStart
+                    ? () => ref.read(panoramaControllerProvider).start()
+                    : null,
+                icon: const Icon(Icons.panorama_horizontal),
+                label: const Text('Take panorama'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: pano.running
+                    ? () => ref.read(panoramaControllerProvider).cancel()
+                    : null,
+                icon: const Icon(Icons.stop),
+                label: Text(pano.state == PanoState.cancelling
+                    ? 'Cancelling…'
+                    : 'Cancel'),
+              ),
+            ),
+          ],
+        ),
+        // Disable-reason travels with the button it explains.
+        if (!grid.canRun && gimbalConnected && cameraConnected)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              grid.overCap
+                  ? 'Too many tiles (${grid.totalShots} > $kPanoMaxTileCount). '
+                      'Use a wider stitched focal or shorter taking lens.'
+                  : 'These focals barely exceed one frame — nothing to '
+                      'stitch. Widen the gap between the two focals.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.error),
+            ),
+          ),
+        const SizedBox(height: 16),
         _FocalSlider(
           label: 'Taking-lens focal',
           value: pano.focalTaking,
@@ -93,49 +140,85 @@ class _PanoTabState extends ConsumerState<PanoTab>
         _TileGridView(
           grid: grid,
           tileStates: pano.tileStates,
+          tileImages: pano.tileImages,
           currentIndex: pano.currentIndex,
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
+        // Phase 6 — assembly mode: Geometric (flat, instant) or OpenPano
+        // (feature-stitched, slower, spherical).
+        Center(
+          child: SegmentedButton<StitchMode>(
+            segments: const [
+              ButtonSegment(
+                value: StitchMode.geometric,
+                label: Text('Geometric'),
+                icon: Icon(Icons.grid_on),
+              ),
+              ButtonSegment(
+                value: StitchMode.openpano,
+                label: Text('OpenPano'),
+                icon: Icon(Icons.auto_awesome),
+              ),
+            ],
+            selected: {pano.stitchMode},
+            showSelectedIcon: false,
+            onSelectionChanged: pano.stitching
+                ? null
+                : (s) => ref
+                    .read(panoramaControllerProvider)
+                    .setStitchMode(s.first),
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Stitch (assemble + cache) / View (open the cached preview).
         Row(
           children: [
             Expanded(
-              child: FilledButton.icon(
-                onPressed: pano.canStart
-                    ? () => ref.read(panoramaControllerProvider).start()
+              child: OutlinedButton.icon(
+                onPressed: pano.canStitch
+                    ? () => ref.read(panoramaControllerProvider).stitchPano()
                     : null,
-                icon: const Icon(Icons.panorama_horizontal),
-                label: const Text('Take panorama'),
+                icon: const Icon(Icons.auto_awesome_mosaic),
+                label: const Text('Stitch pano'),
               ),
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: OutlinedButton.icon(
-                onPressed: pano.running
-                    ? () => ref.read(panoramaControllerProvider).cancel()
+              child: FilledButton.icon(
+                onPressed: (pano.hasStitchedPano && !pano.stitching)
+                    ? () => _openPano(
+                          context,
+                          ref.read(panoramaControllerProvider).stitchedPano!,
+                        )
                     : null,
-                icon: const Icon(Icons.stop),
-                label: Text(pano.state == PanoState.cancelling
-                    ? 'Cancelling…'
-                    : 'Cancel'),
+                icon: const Icon(Icons.fullscreen),
+                label: const Text('View pano'),
               ),
             ),
           ],
         ),
-        if (!grid.canRun && gimbalConnected && cameraConnected)
+        if (pano.stitchError != null)
           Padding(
             padding: const EdgeInsets.only(top: 8),
             child: Text(
-              grid.overCap
-                  ? 'Too many tiles (${grid.totalShots} > $kPanoMaxTileCount). '
-                      'Use a wider stitched focal or shorter taking lens.'
-                  : 'These focals barely exceed one frame — nothing to '
-                      'stitch. Widen the gap between the two focals.',
+              pano.stitchError!,
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.error),
             ),
           ),
       ],
     );
+  }
+
+  /// Open the cached stitched panorama full-screen. Passes a `clone()` so
+  /// the viewer can dispose its copy without invalidating the controller's
+  /// cached image (so "View pano" stays repeatable).
+  void _openPano(BuildContext context, ui.Image pano) {
+    final view = pano.clone();
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      fullscreenDialog: true,
+      builder: (_) => FullScreenImage(loader: () async => view),
+    ));
   }
 }
 
@@ -273,26 +356,33 @@ class _GridSummary extends StatelessWidget {
   }
 }
 
-/// Cell grid: redraws on settings change; cells recolour as the run
-/// captures each tile.
+/// Cell grid — always visible (even before a run / while disconnected).
+/// Empty cells show a subtle border with no fill; as the run captures
+/// each tile its cell fills with that tile's image (demo crop / live SM
+/// thumbnail). See SPEC Phase 4 "Per-tile tile images".
 class _TileGridView extends StatelessWidget {
   const _TileGridView({
     required this.grid,
     required this.tileStates,
+    required this.tileImages,
     required this.currentIndex,
   });
 
   final PanoramaGrid grid;
   final List<TileState> tileStates;
+  final List<PanoTileImage?> tileImages;
   final int currentIndex;
 
   TileState _stateForIndex(int index) =>
       index < tileStates.length ? tileStates[index] : TileState.pending;
 
+  PanoTileImage? _imageForIndex(int index) =>
+      index < tileImages.length ? tileImages[index] : null;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    // Resolve grid coordinates → serpentine index for colour lookup.
+    // Resolve grid coordinates → serpentine index for state/image lookup.
     final indexByRowCol = <int, int>{};
     for (final t in grid.tiles) {
       indexByRowCol[t.row * grid.nCols + t.col] = t.index;
@@ -335,28 +425,111 @@ class _TileGridView extends StatelessWidget {
   Widget _cell(ThemeData theme, int? index, double w, double h) {
     final cs = theme.colorScheme;
     final state = index == null ? TileState.pending : _stateForIndex(index);
+    final image = index == null ? null : _imageForIndex(index);
     final isCurrent = index != null && index == currentIndex;
-    Color color;
+
+    // Fill colour shows only when there's no image yet: empty pending
+    // cells have NO fill (border only); active = the tile being shot;
+    // failed = transient before abort.
+    Color? fill;
     switch (state) {
       case TileState.pending:
-        color = cs.surfaceContainerHighest;
+        fill = null;
       case TileState.active:
-        color = cs.primary;
+        fill = cs.primary.withValues(alpha: 0.30);
       case TileState.taken:
-        color = cs.tertiary;
+        // A taken tile always carries an image (a failed fetch aborts
+        // the run); the tint is only a paint-order backstop.
+        fill = cs.tertiary.withValues(alpha: 0.25);
       case TileState.failed:
-        color = cs.error;
+        fill = cs.error;
     }
-    return Container(
+    return SizedBox(
       width: w,
       height: h,
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(2),
-        border: isCurrent
-            ? Border.all(color: cs.onSurface, width: 2)
-            : null,
+      child: CustomPaint(
+        painter: _TileCellPainter(
+          image: image,
+          fill: fill,
+          border: isCurrent ? cs.onSurface : cs.outlineVariant,
+          borderWidth: isCurrent ? 2 : 1,
+          radius: 2,
+        ),
       ),
     );
   }
+}
+
+/// Paints one grid cell: an optional image (a sub-rectangle of a shared
+/// demo asset, or a whole live thumbnail) cover-fitted into the cell,
+/// else a fill colour, plus a rounded border.
+class _TileCellPainter extends CustomPainter {
+  _TileCellPainter({
+    required this.image,
+    required this.fill,
+    required this.border,
+    required this.borderWidth,
+    required this.radius,
+  });
+
+  final PanoTileImage? image;
+  final Color? fill;
+  final Color border;
+  final double borderWidth;
+  final double radius;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final rrect = RRect.fromRectAndRadius(rect, Radius.circular(radius));
+
+    canvas.save();
+    canvas.clipRRect(rrect);
+    final img = image;
+    if (img != null) {
+      // Cover-fit: shrink the source rect to the cell's aspect (centred)
+      // so the slice fills the cell without distortion.
+      final src = _coverSrc(img.src, size);
+      canvas.drawImageRect(
+        img.image,
+        src,
+        rect,
+        Paint()..filterQuality = FilterQuality.medium,
+      );
+    } else if (fill != null) {
+      canvas.drawRect(rect, Paint()..color = fill!);
+    }
+    canvas.restore();
+
+    canvas.drawRRect(
+      rrect.deflate(borderWidth / 2),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = borderWidth
+        ..color = border,
+    );
+  }
+
+  /// The sub-rect of [src] matching the cell's aspect ratio, centred —
+  /// the source region that maps onto the full cell under cover-fit.
+  Rect _coverSrc(Rect src, Size cell) {
+    final srcAr = src.width / src.height;
+    final dstAr = cell.width / cell.height;
+    var w = src.width;
+    var h = src.height;
+    if (srcAr > dstAr) {
+      w = src.height * dstAr; // too wide → crop horizontally
+    } else {
+      h = src.width / dstAr; // too tall → crop vertically
+    }
+    return Rect.fromCenter(center: src.center, width: w, height: h);
+  }
+
+  @override
+  bool shouldRepaint(_TileCellPainter old) =>
+      old.image != image ||
+      old.fill != fill ||
+      old.border != border ||
+      old.borderWidth != borderWidth ||
+      old.radius != radius;
 }
