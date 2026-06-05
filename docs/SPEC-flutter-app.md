@@ -3896,32 +3896,107 @@ doesn't compound across the grid.
 
 A fourth sub-tab **'Pano'** inside the Camera tab — the nested `TabBar`
 (`lib/ui/tabs/camera_tab.dart`) already hosts Capture / [Virtual S5] /
-Debug-Diagnostics. Its body holds:
+Debug-Diagnostics. Its body holds, **top to bottom**:
 
+- **"Take panorama" + "Cancel" buttons — the first controls in the
+  tab, pinned at the top** (revised 2026-06-04; was originally below
+  the inputs). They sit above the focal/overlap/settle inputs so the
+  primary actions are reachable without scrolling past the parameters.
+  - **"Take panorama"** snapshots the gimbal's current orientation as
+    the grid centre and starts the sequencer. **Enabled only when**:
+    both gimbal (real *or* virtual/demo) and camera are connected, the
+    grid is **not `degenerate`**, and **not `overCap`** (>100 tiles). A
+    `warnCount` (>50) or `degenerate` grid surfaces an inline warning;
+    `overCap`/`degenerate` additionally disable the button.
+  - **"Cancel"** stops a run in progress.
 - **Taking-lens focal** input (slider, 50–150 mm, default 50).
 - **Stitched-image focal** input (slider, 24–100 mm, default 24).
 - **Overlap** slider (0–60 %, default 30 %).
 - **Settle delay** input (seconds, default **3 s**) — the wait after
   each gimbal movement stops, before the shutter fires (see "Settle
   delay" below).
-- **Live tile grid**: a schematic of `n_cols × n_rows` cells, redrawn
-  whenever a focal or overlap value changes, with the computed **tile
-  count** shown. (Span / estimated-duration readouts are optional for
-  the first sweep.)
-- **"Take panorama"** button — snapshots the gimbal's current
-  orientation as the grid centre and starts the sequencer. **Enabled
-  only when**: both gimbal (real *or* virtual/demo) and camera are
-  connected, the grid is **not `degenerate`**, and **not `overCap`**
-  (>100 tiles). A `warnCount` (>50) or `degenerate` grid surfaces an
-  inline warning; `overCap`/`degenerate` additionally disable the
-  button.
-- **Cancel** button — stops a run in progress.
+- **Live tile grid — always visible.** A schematic of `n_cols × n_rows`
+  cells, redrawn whenever a focal or overlap value changes, with the
+  computed **tile count** shown. (Span / estimated-duration readouts
+  are optional for the first sweep.) **The grid renders even before a
+  panorama has been taken, and regardless of connection state** (shown
+  even while disconnected): with no run in progress every cell is an
+  **empty cell with a subtle, neutral border** (a thin outline at the
+  theme's divider colour, no fill), so the user can preview the grid
+  shape while adjusting parameters. Cells take on their per-tile image
+  fill only during/after a run (revised 2026-06-04; previously the grid
+  effectively read as blank pre-run because empty cells had no border).
 
-During a run the same grid doubles as the progress view: each captured
-tile's cell is recoloured. No separate progress screen for the first
-sweep. **Abort on disconnect**: if either the gimbal or the camera
-drops mid-run, stop immediately, surface why, and leave the gimbal where
-it is (no auto-return).
+During a run the same grid doubles as a **live contact sheet**: as each
+tile is shot, its empty cell is **filled with that tile's image** (see
+"Per-tile tile images" below) — not just a flat recolour. No separate
+progress screen for the first sweep. **Abort on disconnect**: if either
+the gimbal or the camera drops mid-run, stop immediately and surface
+why. On termination the gimbal **returns to the captured centre
+whenever its link is still alive** (clean done, cancel, camera-side
+abort, or camera disconnect); it is **left in place only when the
+gimbal link itself is down** (see the return-to-centre rule under
+"Run lifecycle").
+
+#### Per-tile tile images (revised 2026-06-04 — promoted from "Deferred")
+
+Each cell's fill is a real image of that tile, building up a contact
+sheet as the run progresses.
+
+**Seam (decided 2026-06-04).** The sequencer stays **mode-agnostic**:
+after each tile completes it calls a single
+`CameraConnection.fetchPanoTile({col, row, nCols, nRows})` →
+`Future<PanoTileImage?>`. The demo-vs-live branch lives **inside
+`CameraConnection`** (which already exposes `isDemo` / `demoCamera`),
+not in the controller. `PanoTileImage { ui.Image image; Rect src; }`
+unifies rendering — the cell painter always does
+`drawImageRect(image, src, cellRect)`. Two paths feed it:
+
+- **Demo mode — tile the bundled asset in memory.** The Demo Lumix's
+  bundled still (`assets/demo/architecture.jpg`) is loaded + decoded
+  **once** (shared `ui.Image`, owned/disposed by `CameraConnection`).
+  Each tile returns `PanoTileImage(image: sharedAsset, src: subRect)`
+  where `src` is the `(col, row)` sub-rectangle keyed by each tile's
+  **spatial `(col, row)`** (not its serpentine capture order):
+  `asset.width / n_cols` × `asset.height / n_rows`, offset by the cell
+  index. One decode, N draws; the completed grid reassembles the asset
+  into a real mosaic. No transport, no fetch, no `recMode`. Sub-rects
+  are drawn to **cover** their 3:2 cells (slight crop, no distortion).
+- **Live mode — SM thumbnail of each real shot.** After a tile's
+  `capture()` + completion-wait, fetch the **SM (`JPEG_SM`)** variant of
+  the just-taken frame (`fetchLatest()` → SM `GET`), returned as
+  `PanoTileImage(image: thumb, src: fullBounds)` — a distinct `ui.Image`
+  per tile, owned + disposed by the controller. `ContentImage` exposes
+  only `mediumUrl` (SM) and `fullUrl` (LRG) — SM *is* the thumbnail;
+  there is no smaller variant. **This reopens the "no fetch during a
+  run" decision** — fetch timing is **decided: inline, per tile** (see
+  "Per-tile fetch — inline, per tile" under Run lifecycle below), with
+  a `recMode` restore after each fetch. The pano fetch is **isolated**
+  from `_capturedImage` (it does not overwrite the Capture-tab's
+  "last shot" review image).
+
+**A live thumbnail fetch failure aborts the whole run (decided
+2026-06-04).** Unlike the rejected best-effort/fallback idea, the
+thumbnail is **mandatory** in live mode: if `fetchPanoTile` returns
+null / throws — content-server unreachable, decode failure, or the
+off-by-one guard can't confirm a fresh shot (below) — the controller
+treats it like a capture error: mark the tile `failed`, **`_finish`
+into `aborted`** with a clear message, stop the run. There is **no
+"taken but no thumbnail" cell state**. (Demo crops can't fail short of
+a programming error.)
+
+**Off-by-one / freshness guard (live, decided 2026-06-04).**
+`fetchLatest()` returns the highest-`id` item on the card. If SD
+indexing lags the `isBusy→idle` completion signal, the Browse can hand
+back the **previous** tile's frame, shifting every later cell. Guard:
+the controller tracks the last fetched item id and requires the next to
+be **strictly greater**; if not, a brief retry, and if it still hasn't
+advanced, that's a fetch failure → **abort** (per the rule above).
+Demo ids increment synchronously so this never trips in demo.
+
+Both paths converge on the same grid renderer: a cell shows its subtle
+border when empty and its `tileImages[index]` when filled. Because a
+failed fetch aborts, there is no thumbnail-less "taken" cell to render.
 
 There is **no explicit "Read Framing" button** in the first sweep —
 "Take panorama" uses the current gimbal orientation as the centre. (A
@@ -3954,9 +4029,59 @@ controller.
 
 Also: camera-state polling already runs continuously from `connect()`
 to `disconnect()` (`_startPolling`), so `isBusy`/`sdAccess` is a **live
-signal during a run** with no extra wiring. And because panorama never
-touches the DLNA content server (no fetch), the camera never leaves
-record mode — the rec-mode precondition is just a check.
+signal during a run** with no extra wiring.
+
+**Record-mode invariant (now qualified by per-tile thumbnails).** The
+original design had panorama never touch the DLNA content server, so
+the camera never left record mode and the rec-mode precondition was a
+one-time check. The **live per-tile thumbnail** (added 2026-06-04)
+breaks that: fetching any image — even the SM variant — goes through
+`fetchLatest()` → SOAP `Browse`, which **silently flips the camera into
+playback mode** and drops both the shutter and the MJPEG stream;
+`_restoreAfterContentAccess()` must re-assert `recMode` afterward. See
+the next subsection for the *when*.
+
+#### Per-tile fetch — inline, per tile (DECIDED 2026-06-04 — live mode only)
+
+The demo path needs no fetch (it crops the in-memory asset). The live
+path's thumbnail fetch is the only thing that touches the content
+server. **Decision: fetch inline, per tile (Option A)** — the contact
+sheet builds tile-by-tile during the run, as the user asked, accepting
+the per-tile cost. The rejected alternative (Option B: one playback
+pass after the run) is recorded at the end of this subsection.
+
+Per-tile sequence in live mode, replacing the old capture-only loop:
+
+1. Move the gimbal to the tile, then wait the **settle delay**.
+2. `capture()` and run the **completion wait** (min-floor → poll
+   `isBusy` busy→idle → timeout) — camera still in **record mode**.
+3. Fetch the SM thumbnail (`fetchLatest()` → SM `GET`). This **flips
+   the camera into playback mode**. Apply the **freshness guard**: the
+   browsed item id must be **strictly greater** than the previous
+   tile's; a brief retry otherwise.
+4. **Re-assert `recMode` and confirm record mode is restored *before*
+   the next tile's `capture()`** — a shot fired in playback mode
+   silently no-ops. The completion of step 4 gates step 1 of the next
+   tile; do not race the next move/capture against the restore. Run the
+   `recMode` restore even on the failure path (step 5) so the camera is
+   left sane.
+5. **On success**, place the decoded SM image into `tileImages[index]`;
+   the cell repaints from border-only to the thumbnail. **On failure**
+   (null/throw, or the freshness guard never advancing), mark the tile
+   `failed` and **abort the whole run** (`aborted` + message) — the
+   thumbnail is mandatory, there is no thumbnail-less "taken" state.
+
+This adds a SOAP `Browse` + SM `GET` + `recMode` round-trip to *every*
+tile, so a live run is **materially slower per tile** than the
+capture-only sweep — an accepted trade for the live contact sheet. The
+preview stream stays stopped for the whole run (as before), so the only
+record↔playback churn is this per-tile fetch.
+
+> **Rejected — Option B (one playback pass after the run):** capture
+> the whole grid in record mode, then a single excursion browses the
+> last `N` shots and fills all cells at once. Faster, preserves the
+> record-mode invariant during capture, but the sheet fills only after
+> the sweep — which is not the live tile-by-tile behaviour requested.
 
 ### Run lifecycle, preconditions & completion
 
@@ -3989,11 +4114,21 @@ A *complete* run needs more than the per-tile loop:
   minimum floor, in case the busy window is too brief to observe at the
   poll rate) before the next move. Requires camera-state polling active
   during the run.
-- **On completion / cancel / abort (decided).** On **clean completion**
-  the gimbal **returns to the captured centre**; **Cancel** stops after
-  the current tile and likewise returns to centre (the link is alive).
-  **Disconnect** mid-run aborts and leaves the gimbal where it is — a
-  dropped link can't be driven home.
+- **On completion / cancel / abort (decided; return-to-centre rule
+  revised 2026-06-04).** The unifying rule: **return to the captured
+  centre on any termination while the gimbal link is still alive; leave
+  the gimbal in place only when the gimbal link itself is down** (it
+  can't be driven home). Concretely:
+  - **Clean completion** → return to centre.
+  - **Cancel** (stops after the current tile) → return to centre.
+  - **Camera-side abort** — a tile **capture error** *or* a **thumbnail-
+    fetch failure** (see "Per-tile tile images") — the gimbal is
+    healthy, so **return to centre** (revised 2026-06-04; previously
+    these left the gimbal in place).
+  - **Camera disconnect** mid-run → gimbal link still alive, so still
+    **return to centre**.
+  - **Gimbal disconnect / move-disconnected** → leave the gimbal where
+    it is (dropped link can't be driven home).
 
 ### PR breakdown (later)
 
@@ -4038,18 +4173,57 @@ can proceed in parallel.
       frame setup flags `degenerate` and locks Take.
 - [x] Lock-out: during a run the Gimbal-tab controls + Pano inputs are
       disabled and navigation is blocked; Cancel stays live.
-- [ ] A tile capture error aborts the whole run (not just that tile).
-      *(Hard to trigger on the demo camera; verify on hardware.)*
+- [ ] A tile capture error aborts the whole run (not just that tile)
+      and **returns to centre** (gimbal healthy). *(Hard to trigger on
+      the demo camera; verify on hardware.)*
 - [x] Cancel mid-run stops after the current tile and **returns to
       centre**; clean completion also returns to centre.
-- [ ] Disconnect mid-run (gimbal or camera) → `aborted` with a clear
-      reason, gimbal left in place; app stays responsive. *(Verify on
-      hardware.)*
+- [ ] Disconnect mid-run → `aborted` with a clear reason; app stays
+      responsive. **Camera** disconnect still returns to centre (gimbal
+      link alive); **gimbal** disconnect leaves the gimbal in place.
+      *(Verify on hardware.)*
 - [ ] Hardware: a real small grid (e.g. 3×3) on the SCORP-C2 + S5 lands
       tiles with visible overlap; residual error doesn't compound across
       the grid (closed-loop delta-from-measured holds).
 - [ ] Settle delay actually reduces motion blur vs. zero-settle (bench
       observation).
+
+Pano-tab revision (2026-06-04) checkpoints:
+
+- [ ] Buttons-first layout: Take/Cancel are the topmost controls,
+      reachable without scrolling past the inputs.
+- [ ] Grid always visible: renders subtly-bordered empty cells before
+      any run **and while disconnected**; cells show only the border
+      (no fill) until a tile is shot.
+- [ ] Demo mosaic: a completed demo run reassembles
+      `architecture.jpg` — each cell holds its **spatial** `(col,row)`
+      crop, not the serpentine capture order, so the grid reads as one
+      coherent image.
+- [ ] Live thumbnail: each tile's SM thumbnail appears in its cell as
+      the run progresses (tile-by-tile, not all at the end), and the
+      Capture-tab "last shot" review image is **not** disturbed.
+- [ ] Live record-mode restore holds: across an N-tile live run every
+      shot lands (none silently no-op in playback mode) — i.e. the
+      per-tile `recMode` restore completes before each next `capture()`.
+      *(Verify on hardware.)*
+- [ ] Live thumbnail-fetch failure **aborts the whole run** with an
+      error message (mandatory thumbnail; no thumbnail-less "taken"
+      cell). *(Verify on hardware.)*
+- [ ] Freshness guard: the browsed item id strictly increases per tile;
+      a lagging-index Browse retries, and a non-advancing id aborts
+      rather than mis-filling later cells. *(Verify on hardware.)*
+
+### Phase 4 — PR breakdown (revision 2026-06-04 — Pano-tab updates)
+
+| PR | Scope | Key files | Verify on |
+|----|-------|-----------|-----------|
+| **PR 17** | Layout only: Take/Cancel pinned to the top (disable-reason text moves with them; `_ConnectHint` stays above); empty cells → no-fill + subtle divider border; confirm grid renders while disconnected | `lib/ui/tabs/pano_tab.dart` | demo APK |
+| **PR 18a** | Per-tile image plumbing **+ demo path**: `PanoTileImage{image,src}` model, `_tileImages` in the controller, `CameraConnection.fetchPanoTile(...)` (demo crop branch + shared-asset decode/ownership), `CustomPainter` cell renderer (`drawImageRect`, cover) | `panorama_controller.dart`, `camera_connection.dart`, `demo_lumix_camera.dart`, `pano_tab.dart` | demo APK (mosaic reassembles) |
+| **PR 18b** | Per-tile image **live path**: `fetchPanoTile` live branch (SM fetch + **awaited** `recMode` restore, isolated from `_capturedImage`), strictly-increasing-id freshness guard + retry, **abort-on-fetch-failure** | `camera_connection.dart`, `panorama_controller.dart` | **hardware** (S5) |
+
+Rationale for the split: PR 17 and PR 18a are fully demo-verifiable
+with no camera; PR 18b quarantines the only hardware-gated,
+record-mode-touching, abortable path into its own reviewable change.
 
 ### Phase 4 — as built (PR 14–16, demo-verified 2026-06-01)
 
@@ -4059,6 +4233,18 @@ can proceed in parallel.
 - **PR 15** — `lib/ui/tabs/pano_tab.dart`: the 'Pano' sub-tab (4th in the
   Camera `TabBar`), two focal sliders + overlap (0–60 %) + settle (0–10
   s), live cell grid that recolours per tile, Take/Cancel.
+  - **Pending revision (spec'd 2026-06-04, not yet built — see
+    "PR breakdown (revision 2026-06-04)": PR 17 / 18a / 18b):** move
+    Take/Cancel to the top as the first controls; always render the
+    grid as subtly-bordered empty cells pre-run (even disconnected);
+    and fill each cell with a **per-tile image** during/after a run via
+    a mode-agnostic `CameraConnection.fetchPanoTile(...)` — demo crops
+    the bundled asset in memory (cover), live fetches the SM thumbnail
+    inline per tile with an awaited `recMode` restore, a
+    strictly-increasing-id freshness guard, and **abort-on-fetch-
+    failure** (mandatory thumbnail). See "UI — the 'Pano' sub-tab",
+    "Per-tile tile images", and "Per-tile fetch — inline, per tile"
+    above.
 - **PR 16** — `lib/state/panorama_controller.dart`: riverpod
   `PanoramaController` running the serpentine sequencer on
   `GimbalConnection.moveByAngle` + `CameraConnection.capture()` (the
@@ -4094,11 +4280,10 @@ can proceed in parallel.
 
 ### Deferred (later enhancements, not in the first sweep)
 
-- **Per-tile thumbnails into the grid cells** (a true contact sheet),
-  which would also require the demo Lumix to **tile its bundled asset
-  in memory** so the demo mosaic is real rather than the same frame N
-  times. Dropped from the first sweep in favour of coloured-cell
-  progress.
+- ~~**Per-tile thumbnails into the grid cells** (a true contact sheet),
+  which would also require the demo Lumix to tile its bundled asset in
+  memory.~~ **Promoted into scope 2026-06-04** — see "Per-tile tile
+  images" and "Per-tile fetch vs. the record-mode invariant" above.
 - **Explicit Read-Framing / compose-then-confirm** step (centre is the
   current orientation at "Take panorama" time for now).
 - **Span / estimated-duration readouts** in the Pano sub-tab (tile
@@ -4279,12 +4464,448 @@ relies on.
   project starts.
 - iOS / desktop / web targets (still excluded).
 
+## Phase 6 — On-device stitch preview
+
+A **"Stitch pano"** button below the tile grid assembles the captured
+tiles into a single panorama on-device and shows it **full-screen**
+(analogous to the Capture-tab image viewer). A **"View pano"** button
+re-opens the cached result. This is a *preview* for judging framing —
+full-resolution / archival stitching still happens off-device (PTGui /
+Hugin / Lightroom).
+
+> **CURRENT STATE (2026-06-05) — read this first; it supersedes the
+> OpenCV design recorded in the subsections below.** The preview now has
+> **two GUI-selectable assembly modes**, and the OpenCV path was
+> abandoned. See **"Engine: the full journey & as-built"** immediately
+> below. The older subsections (OpenCV decisions / pipeline / PR 19–21 /
+> tuning) are kept as a record of what was tried and why.
+
+### Engine: the full journey & as-built (2026-06-05)
+
+**Two selectable modes** (segmented toggle above Stitch/View in the Pano
+sub-tab; `StitchMode` on `PanoramaController`, default **geometric**):
+
+1. **Geometric (default).** Pure-Dart (`lib/panorama/geometric_stitcher.dart`):
+   paste each tile at its **known** grid position (`TilePosition.srcFrac*`,
+   from the gimbal geometry) onto a **flat** canvas, feather-blending the
+   overlaps (`saveLayer` + radial `dstIn` mask). **Planar → no
+   projection distortion**; **instant**; **deterministic**; **can't drop
+   tiles**. Uses the geometry directly (no feature matching), so it's
+   immune to repetitive/low-feature content. Correct for narrow/modest
+   FOV (the demo and typical gimbal panos). Canvas aspect = the grid's
+   angular coverage (`(n−1)·step + tile`). This is the recommended
+   preview engine.
+2. **OpenPano (optional).** Native feature-stitcher (vendored
+   [ppwwyyxx/OpenPano], cross-compiled for arm64). Corrects alignment by
+   matching real content, so it's robust to gimbal imprecision/parallax
+   — but it projects onto a **sphere** (curves content **inward**, even
+   at narrow FOV) and is **slow** (SIFT + bundle adjustment, serial on
+   ARM). Kept for genuinely **wide** panoramas where planar can't
+   represent the spread.
+
+**Why not OpenCV (extensively tested, then abandoned).** OpenCV's
+high-level `cv::Stitcher` is **non-deterministic and unreliable** on a
+regular grid — the same tiles give a correct stitch, a dropped-tile
+fragment, or a degenerate giant canvas across runs. Two confirmed
+causes: the **OpenCL bug** ([opencv #22125], random results with OpenCL
+on — relevant to the phone GPU) and inherent **RANSAC randomness**
+(reproduced on the dev box with `cv2`: ~3/8 of 6×6 runs blew up). Every
+lever was tried — `PANORAMA`/`SCANS`, `setPanoConfidenceThresh`
+(0.3 keeps bad tiles → blow-ups; 1.0 drops weak tiles → fragments — no
+good value), a neighbour matching mask, `setUseOpenCL(false)` — none
+made it reliable. The Java AAR also lacks `Stitcher` bindings entirely
+(we'd already worked around that with a static-linked C++ shim). All of
+OpenCV was then **dropped** from the native side.
+
+**Why OpenPano works where OpenCV didn't.** Same algorithm family
+(SIFT + RANSAC + bundle adjust), but its implementation is empirically
+**stable on our tiles** (4/4 identical complete stitches on the dev box
+where OpenCV blew up). Validation was done **on Linux with the real
+demo tiles** (fast loop) before any phone build.
+
+**OpenPano Android port (the work):**
+- Vendored `src/` (34 `.cc` files) + Eigen under
+  `android/app/src/main/cpp/openpano/` + `eigen/`.
+- Cross-compile fixes: the bundled **FLANN** uses C++17-removed
+  `std::binary_function` / `std::random_shuffle` → re-enabled via libc++
+  `_LIBCPP_ENABLE_CXX17_REMOVED_*` macros; **PNG-only I/O** through
+  bundled **lodepng** (`-DDISABLE_JPEG`, no libjpeg); **OpenMP**
+  `-fopenmp -static-openmp`. arm64-v8a only.
+- JNI: `stitch.cpp` → `openpano_stitch()` (`cpp/openpano_stitch.{h,cc}`)
+  builds `pano::Stitcher` in **camera-estimation mode** (the config that
+  reliably completes), file paths in / PNG out. Same `StitchChannel`
+  contract as before (Dart writes tiles to `cacheDir/pano_stitch/`,
+  passes paths).
+- **OpenPano tuning (vendored-source patches):**
+  - **Neighbour-restricted matching** — `pairwise_match()` skips
+    non-overlapping pairs using `g_grid_cols` (we pass `nCols`; tiles
+    fed row-major), O(N²)→~O(N). Validated correctness-neutral.
+  - **`CROP 0`** — don't crop the spherical result to a rectangle (that
+    cut off curved edges → "missing parts" on some grids). Now the full
+    captured frame shows, with black borders + the inward curve.
+  - **Progress reporting** — `pano_report_progress()` writes
+    `"<stage> <done> <total>"` to a file the Dart side polls (300 ms);
+    instrumented per-tile in `calc_feature` (features), `pairwise_match`
+    (matching), the incremental BA loop in `camera_estimator` (estimating
+    — the serial cost that dominates on the phone with many tiles), and
+    the blend loop (blending). The overlay shows a determinate ring + %.
+  - **Rejected:** `MULTIPASS_BA 0` (faster BA but wavy/worse output);
+    `TRANS`/affine mode (planar, no shift — but requires ordered input
+    and **aborts on the first weak-feature pair**; tried row-major *and*
+    serpentine, both abort); lowering `SIFT_WORKING_SIZE`/octaves (tiles
+    are feature-marginal → any reduction breaks matching).
+
+**Shared UI/state (`PanoramaController`, both modes):** `stitchPano()`
+dispatches on `stitchMode`; full-fill `_StitchOverlay` (ring + % +
+Cancel) blocks nav while stitching; **soft-cancel** via `_stitchGen`;
+in-memory `stitchedPano` cache invalidated only by "Take panorama";
+"View pano" opens a `clone()` so the cache survives repeated views.
+
+**Decisions locked from this work:**
+- **Planar (geometric) by default; spherical (OpenPano) only for wide
+  FOV.** Narrow/modest FOV is accurately *and* distortion-free modelled
+  by planar placement.
+- The inward shift is **inherent to OpenPano's spherical projection**,
+  not a tunable bug.
+- Geometric placement *is* the "geometry-seeded" approach — it uses the
+  known tile positions directly. OpenPano is **not** position-seeded
+  (only neighbour-adjacency via `nCols`).
+
+**Deferred:** position-seeding OpenPano's bundle adjustment from the
+gimbal angles (seed + refine — robust *and* feature-corrected, but real
+`cv::detail`-style work); now largely redundant since geometric already
+delivers deterministic/flat/instant. Feather-blend quality tuning (the
+radial mask is a first cut).
+
+**Networked HQ-stitch service (later — not bundled in the app).**
+Evaluate **libpano13 (`nona`) + enblend** — Hugin's desktop-grade
+aligner + multi-resolution blender — running as an **external networked
+service** the app calls for a full-quality stitch. This is a separate
+quality tier *above* the on-device preview (geometric/OpenPano), kept off
+the phone (libpano13/enblend drag in heavy desktop deps — vigra, boost,
+lcms — so they were never going to be cross-compiled into the APK). A
+throwaway `/tmp` host harness (Hugin AppImage → `nona`/`enblend` over the
+real demo tiles) was being set up to gauge output quality when work
+paused; it is **not yet done** and nothing from it lands in the app.
+
+**Cleanup done (2026-06-05):** the dead OpenCV Android-SDK download and
+the temporary on-screen build-marker have both been removed —
+`build.gradle.kts` and the native side are now OpenCV-free.
+
+**Open / unverified:** geometric mode's on-device feather rendering
+(first run); live mode for both engines (needs hardware); how geometric
+seams hold up against real gimbal-angle imprecision.
+
+---
+
+### Decisions (confirmed in discussion 2026-06-04) — *superseded; OpenCV-era, kept as record*
+
+- **Backend — native Android via a `MethodChannel` + a thin C++/JNI
+  stitch shim (as built 2026-06-05).** Per the user's preference for a
+  Java/native backend, the stitch runs natively, not via the Dart FFI
+  binding. **Correction to the original plan:** OpenCV's prebuilt
+  Android distribution does **not** expose the high-level `cv::Stitcher`
+  — neither as a Java class (`org.opencv.stitching` is absent from the
+  AAR's Java API) **nor** as linkable symbols in the prebuilt
+  `libopencv_java4.so` (verified with `nm`; a long-standing OpenCV
+  limitation). So the Maven AAR is **not** usable here. Instead:
+  - The Gradle build **downloads the OpenCV Android SDK 4.11.0** once
+    (cached under the Gradle home so `flutter clean` doesn't re-fetch)
+    and **static-links** the stitching modules (`stitching`,
+    `features2d`, `calib3d`, `flann`, `imgproc`, `imgcodecs`, `core` +
+    3rd-party) into our own shared lib via OpenCV's CMake config
+    (`OpenCV_STATIC ON`).
+  - `cpp/stitch.cpp` is a ~40-line JNI function
+    (`...StitchChannel_nativeStitch`) calling
+    `cv::Stitcher::create(cv::Stitcher::PANORAMA)->stitch(imgs, pano)`,
+    built into `libpanostitch.so`.
+  - `StitchChannel.java` (a `MethodChannel`
+    `at.sciens.gimbal_controller/stitch`, same style as
+    `WifiNetworkChannel` / `NsdChannel`) loads `libpanostitch.so`,
+    marshals paths in / status out on a background `Executor`. The Dart
+    side never imports OpenCV.
+  - **arm64-v8a only**: Flutter owns `ndk.abiFilters` (so setting it in
+    `defaultConfig` is overridden, and `--target-platform` only trims
+    Flutter's own engine lib), so the restriction is enforced two ways
+    that *do* stick — `externalNativeBuild.cmake.abiFilters("arm64-v8a")`
+    (don't build the heavy shim for other ABIs) **plus**
+    `packaging.jniLibs.excludes` for non-arm64 libs.
+  - **Measured (debug build):** the OpenCV addition is
+    `libpanostitch.so` ≈ **11 MB** (arm64); the static-linked stitch
+    modules live inside it. No hard ceiling was set.
+- **Channel transport — file paths, not bytes (avoids the Binder
+  limit).** A `MethodChannel` rides Binder, whose transaction buffer is
+  ~1 MB; passing N SM thumbnails + the stitched result as byte arrays
+  would overflow it. Instead the Dart side **writes each tile image to a
+  temp file** (PNG/JPEG in `cacheDir`), passes the **list of paths**;
+  Java `Imgcodecs.imread`s them, stitches, writes the result to a file,
+  and returns **that path**; Dart loads it as a `ui.Image`. Disk-based,
+  consistent with the Phase 5 hand-off, and immune to payload size.
+- **Native threading.** `MethodChannel` handlers run on the platform
+  main thread, so the Java stitch (seconds) must run on a **background
+  `Executor`** and post the result back to the main thread before
+  replying — otherwise it ANRs.
+- **Source = the in-memory tile images.** The stitch consumes the
+  `_tileImages` already captured by the Phase 4 run — **demo crops** or
+  **live SM thumbnails**. So a live preview pano is SM-resolution; that
+  is acceptable for a preview. (Full-res LRG stitching is out of scope
+  here.)
+- **Demo source must actually overlap (key change).** Today the demo
+  crop partitions the asset into **disjoint** `(col,row)` cells. For the
+  stitcher to find correspondences, the demo tiles become **overlapping
+  windows derived from the grid geometry**: each tile is a `tileH×tileV`
+  FOV window stepped by `step = tile·(1−overlap)`. **The asset maps to
+  the grid's _total coverage_ (`(n−1)·step + tile`), not the stitched
+  FOV** — mapping to `hSpan` made edge tiles run off the asset and clamp
+  to slivers (a PR-20 bug, fixed 2026-06-05); with total-coverage the
+  grid fills `[0,1]` exactly and every tile is a full frame. **Confirmed
+  consequence (the user wants the stitched image, not a mosaic):** the
+  contact-sheet grid now shows **overlapping frames** (realistic), and
+  the clean reassembly is the **stitched preview** — which should come
+  out ≈ the original asset. This makes the demo a genuine end-to-end
+  test of the stitch pipeline with **no hardware**.
+- **Trigger — a "Preview pano" button below the tile grid.** Enabled
+  **only after a completed run** (`state == done`, every tile has an
+  image) and never during a run. (Decided: completed runs only — a
+  partial/cancelled grid has gaps that defeat a clean stitch.)
+- **Viewer — extract the Capture-tab full-screen widget and share it.**
+  PR 8's `_FullScreenImage` (immersive `InteractiveViewer`, pinch-zoom,
+  spinner → image / error) is **extracted from `camera_tab.dart` into a
+  shared widget** (`lib/ui/full_screen_image.dart`) that accepts a ready
+  `ui.Image` **or** an async loader. The Capture still keeps its async
+  fetch; the pano passes the in-memory stitch result, and the spinner
+  covers the stitch compute instead of a download.
+
+### Pipeline
+
+1. On "Preview pano", gather the captured tile images in **row-major**
+   order (`Stitcher` is order-agnostic, but ordered input helps the
+   matcher).
+2. **Dart → disk.** Materialise each tile to a temp file: a live tile is
+   a standalone `ui.Image` (`toByteData` → PNG); a demo tile is a
+   sub-rect of the shared asset, cropped to its `src` first. Collect the
+   file paths.
+3. **Dart → Java** over the `stitch` channel: `stitch(paths) →`
+   result-path (or an error code).
+4. **Java**: `imread` each path → `List<Mat>`;
+   `Stitcher.create(PANORAMA).stitch(mats, result)`; on `Stitcher.OK`
+   `imwrite` the result to a temp file and return its path; else return
+   the status code. Runs on a background `Executor`.
+5. **Dart**: on a result path → decode → `ui.Image` → open the shared
+   full-screen viewer. On a non-OK status
+   (`ERR_NEED_MORE_IMGS` / `ERR_HOMOGRAPHY_EST_FAIL` /
+   `ERR_CAMERA_PARAMS_ADJUST_FAIL`) → a clear inline error
+   ("Couldn't stitch — not enough overlap/detail"). No crash.
+6. The viewer shows a **spinner during the compute**; temp files are
+   cleaned up after.
+
+### Architecture / seam
+
+- **Native**: `cpp/stitch.cpp` + `cpp/CMakeLists.txt` (static-links the
+  OpenCV SDK via `find_package(OpenCV)` with `OpenCV_STATIC`) build
+  `libpanostitch.so`, exposing the JNI `nativeStitch(String[] paths,
+  String outPath) → int`.
+- **Java**: `StitchChannel.java`
+  (`android/app/src/main/java/at/sciens/gimbal_controller/`), a
+  `MethodChannel` named `at.sciens.gimbal_controller/stitch` with one
+  method `stitch(List<String> paths) → String resultPath | error`,
+  which calls the native shim on a background `Executor`. Registered in
+  `MainActivity.configureFlutterEngine` alongside the existing channels.
+  (No `OpenCVLoader` — the shim is self-contained.)
+- **Dart**: a `PanoStitcher` service (`lib/panorama/pano_stitcher.dart`)
+  owns the temp-file dance + the channel call, returning
+  `Future<StitchResult>` (an OK `ui.Image` or a status). The
+  `PanoramaController` stays OpenCV-free — it only supplies
+  `tileImages`; the Pano sub-tab invokes the stitcher.
+- `ui.Image` → PNG bytes via `toByteData(format: png)`; demo crops use
+  the tile's `src` rect (drawn to an offscreen `PictureRecorder` →
+  `toByteData`).
+
+### Risks & open questions (Phase 6)
+
+- **APK size (real).** The `org.opencv:opencv` AAR bundles native libs
+  for all ABIs; stitching pulls in `features2d` / `calib3d` / `imgproc`.
+  Restrict to **`arm64-v8a`** (the SCORP-control phone target) via
+  `ndk { abiFilters 'arm64-v8a' }` to bound growth. **No hard size
+  ceiling** (confirmed 2026-06-04) — just report the actual delta on the
+  PR 19 build.
+- **Binder payload.** Resolved by the file-path transport above — never
+  send image bytes through the channel.
+- **Demo pixel extraction.** Demo tiles share one asset image; the
+  stitch path must crop each `src` into its own file before handing to
+  Java.
+- **Preview resolution.** Live = SM (~480 px) → low-res preview pano,
+  by design. Full-res LRG stitch is a later enhancement.
+- **Memory / cleanup.** Temp files live under **`cacheDir/pano_stitch/`,
+  cleared at the start of each preview** (confirmed 2026-06-04). Dispose
+  intermediate `ui.Image`s, delete the per-tile temps once Java returns
+  and the result temp once it's decoded into a `ui.Image`; release
+  `Mat`s on the Java side.
+- **Touches already-built code.** The overlapping-window demo crop
+  modifies PR 18a's `fetchPanoTile` demo branch + adds the grid→asset
+  pixel mapping; the shared-viewer extraction modifies `camera_tab.dart`.
+- **Native stitch is device-only.** The `cv::Stitcher` path can't be
+  exercised by `flutter test` (host) — it needs an arm64 device/emulator.
+
+### PR breakdown
+
+| PR | Scope | Verify on |
+|----|-------|-----------|
+| **PR 19** | Gradle: download OpenCV SDK 4.11.0 (cached in Gradle home), static-link via `OpenCV_STATIC`; `cpp/stitch.cpp` JNI shim (`cv::Stitcher` PANORAMA) → `libpanostitch.so`; `StitchChannel.java` (background `Executor`, file-path in/out) registered in `MainActivity`; Dart `PanoStitcher` service (temp-file dance + channel); arm64-only via `cmake.abiFilters` + `packaging.jniLibs.excludes` | device smoke + APK size |
+| **PR 20** | Demo overlapping-window crops: per-tile `srcFrac*` in the grid math; `fetchPanoTile` demo branch maps them onto the asset (clamped) | demo APK (contact sheet shows overlap) |
+| **PR 21** | "Preview pano" button below the grid (enabled on `done`, ≥2 tiles); extract shared `FullScreenImage` from `camera_tab.dart`; wire stitch → viewer with spinner + error | demo APK (preview ≈ asset); live on hardware |
+
+### Phase 6 — as built (PR 19–21, 2026-06-05)
+
+- **PR 19** — `android/app/build.gradle.kts` (SDK download + static
+  link + arm64-only), `cpp/CMakeLists.txt`, `cpp/stitch.cpp` (JNI
+  `nativeStitch`), `StitchChannel.java`, `MainActivity.java` (register),
+  `lib/panorama/pano_stitcher.dart` (`PanoStitcher` + `StitchResult`,
+  temp files under `cacheDir/pano_stitch/`). APK delta ≈ 11 MB
+  (`libpanostitch.so`, arm64).
+- **PR 20** — `lib/panorama/panorama_grid.dart` adds `srcFrac*` to
+  `TilePosition`; `fetchPanoTile` consumes the fraction (overlapping
+  windows). Test: `test/pano_tile_image_test.dart` asserts adjacent
+  tiles overlap.
+- **PR 21** — `lib/ui/full_screen_image.dart` (shared viewer, loader +
+  failureMessage), `camera_tab.dart` rewired to it, `pano_tab.dart`
+  "Preview pano" button + `_openPreview` (row-major order → stitch →
+  viewer).
+- **Status:** `flutter analyze` clean; 121 unit tests pass; arm64-v8a
+  debug APK builds. **Not yet device-verified:** the actual on-device
+  `cv::Stitcher` run (demo mosaic + live), the spinner/error UX, and the
+  background-thread/ANR behaviour — all need an arm64 device/emulator.
+
+### Stitch progress, caching & two-button split (enhancement, spec'd 2026-06-05)
+
+Splits the single "Preview pano" into a **stitch** step (with progress
+feedback) and a **view** step (cached), so a slow stitch shows what's
+happening and the result can be reviewed repeatedly without recomputing.
+
+**Two buttons (below the tile grid), replacing "Preview pano":**
+- **"Stitch pano"** — runs the stitch behind a progress overlay and
+  **caches** the result on success. Enabled after a completed run
+  (`state == done`, ≥2 tiles). **Stays enabled** after a successful
+  stitch (re-stitch allowed — decided).
+- **"View pano"** — opens the **cached** stitched image in the shared
+  `FullScreenImage` viewer. Enabled only when a cached pano exists.
+  Repeatable — no re-stitch.
+
+**Stitch state moves into `PanoramaController`** so the overlay + both
+buttons are reactive and survive rebuilds / sub-tab switches:
+`stitching` (bool), `stitchStage` (for the overlay label),
+`stitchedPano` (`ui.Image?`, cached result), `stitchError` (String?),
+plus `stitchPano()` / `cancelStitch()`. It delegates to the existing
+`PanoStitcher` (OpenCV stays native); "View pano" reads `stitchedPano`.
+
+**Progress overlay — indeterminate + stage label (decided).**
+`cv::Stitcher::stitch()` is a single opaque blocking native call with no
+progress callback, so there is **no real percentage** to show. The
+overlay mirrors `_CaptureOverlay` (full-fill `ColoredBox`, absorbs taps,
+ring + Cancel) and shows:
+- a **determinate** ring for the Dart-side **tile-encoding** stage
+  ("Preparing tiles N/total" — this part is genuinely measurable), then
+- an **indeterminate** ring + "Stitching…" for the opaque native stage.
+**Full-screen** overlay (decided); **blocks navigation** until
+done/cancel, like a run.
+
+**Caching — in memory, run-invalidated (decided).** The stitched pano is
+cached **in memory** on the controller. The **only** invalidation
+trigger is **"Take panorama"** — starting a new run clears
+`stitchedPano` and disables "View pano". Changing focals / overlap /
+settle after a stitch does **not** invalidate it. The cache does **not**
+persist across app restarts.
+
+**Cancel — soft cancel (decided 2026-06-05, built).** The native
+`cv::Stitcher` call can't be interrupted mid-flight (no cancellation
+token). Since SCANS + the matching mask brought the preview down to a
+few seconds, the stage-split checkpoint wasn't worth the complexity:
+Cancel dismisses the overlay immediately, and the orphaned native call
+finishes in the background with its result **discarded** via a
+**generation id** (`_stitchGen`; a stitch whose generation has been
+superseded by Cancel or a new run drops + disposes its result). This
+also cleanly handles "cancel then re-stitch".
+
+### Stitch performance — findings & tuning (under measurement, 2026-06-05)
+
+On-device the first stitches were pathologically slow (**~210 s**), and
+instrumentation (temporary phase timers surfaced in the GUI) localised
+it. Findings + the levers being applied:
+
+- **Compose, not estimate, dominated** (≈175 s of 210 s) because the
+  output canvas blew up. Root cause: **`Stitcher::PANORAMA` is a
+  rotational/spherical model**, but the **demo** tiles are flat
+  translational crops of a flat image — the camera solve mis-fits and
+  produces a degenerate giant canvas. Fix: **demo → `Stitcher::SCANS`**
+  (affine/planar). (`setCompositingResol` was tried first and was a
+  no-op — the tiles are already ≤1 Mpx, so capping input resolution
+  changed nothing; the canvas extent is what blows up.)
+- **Live → `PANORAMA`** stays correct (a real gimbal genuinely rotates);
+  the demo's blow-up is a demo artefact, not an inherent `PANORAMA`
+  cost. Mode will be chosen by `isDemo` when live is wired.
+- **Matching mask (option 1, implemented).** Feature matching is
+  O(N²) across tiles. We feed tiles **row-major** and know each tile
+  only overlaps its 8 grid neighbours, so a `setMatchingMask` built from
+  `nCols` restricts matching to neighbours → ~O(N). Works with any
+  matcher type (so it composes with SCANS' affine matcher). `nCols` is
+  threaded Dart → channel → JNI.
+- **Future enhancement (option 2 — deferred): seed cameras from the
+  gimbal angles.** We have each tile's `yaw/pitch`; the low-level
+  `cv::detail` pipeline could initialise the cameras from those (instead
+  of solving blind), making the stitch fast **and** robust **and**
+  removing the demo/live model split — but it means hand-building the
+  detailed pipeline (FeaturesFinder → matcher → BundleAdjuster → warper
+  → blender). Only pursue if the high-level path proves inadequate.
+
+The phase-timer instrumentation (native two-phase split + GUI readout)
+has been **removed** (2026-06-05) now that the cancel strategy is locked
+(soft cancel) — the native is back to a single `stitch()` call.
+
+**As built (2026-06-05).** "Stitch pano" / "View pano" buttons; stitch
+state (`stitching`, `stitchStage`, `stitchedPano`, `stitchError`,
+`_stitchGen`, `stitchPano()`, `cancelStitch()`, `canStitch`) lives on
+`PanoramaController`; a full-fill `_StitchOverlay` (indeterminate spinner
++ stage label + Cancel) in the Camera tab; sub-tab + top-nav switching
+locked on `running || stitching`; the cached `stitchedPano` is cleared
+on "Take panorama"; "View pano" opens a `clone()` so repeated views don't
+dispose the cache. SCANS mode is still hard-coded (live→PANORAMA wiring
+pending — needs hardware).
+
+### Verification checkpoints (Phase 6)
+
+- [ ] Demo: a completed run + "Preview pano" → the native OpenCV
+      stitcher reassembles the overlapping demo crops into one image ≈
+      the original asset, shown full-screen with pinch-zoom.
+- [ ] The "Preview pano" button is disabled during a run and before any
+      completed run.
+- [ ] A non-stitchable set surfaces a clear error, no crash; temp files
+      are cleaned up.
+- [ ] The stitched view matches the Capture-tab full-screen UX
+      (immersive, `InteractiveViewer`, spinner while computing) — both
+      tabs now share one widget.
+- [ ] Stitch runs on a background thread (no ANR on large grids).
+- [ ] Live (hardware): a real completed grid stitches its SM thumbnails
+      into a recognisable preview pano.
+- [x] arm64-v8a only; OpenCV adds ≈ 11 MB (`libpanostitch.so`). No hard
+      ceiling set.
+
+### Out of scope (Phase 6)
+
+- Full-resolution / archival stitching (stays external: PTGui / Hugin /
+  Lightroom).
+- Stitching from the LRG originals; control-point editing; projection
+  choice. Preview uses `Stitcher` defaults.
+- Persisting / exporting the preview pano (view-only for now; export
+  could tie into the Phase 5 hand-off later).
+
 ## Out of scope (entire project)
 
 - iOS / desktop / web targets.
 - Camera-side control over PTP/MTP or USB tether — we use the
   camera's WiFi remote-control interface (Phase 2) and the gimbal's
   shutter cable.
-- Image stitching — done in PTGui / Hugin / Lightroom after capture.
+- **Final / archival** image stitching — done in PTGui / Hugin /
+  Lightroom after capture. (An on-device **preview** stitch is in scope
+  as Phase 6.)
 - Firmware updates to the gimbal.
 - Redistribution of any decompiled or derived code.
