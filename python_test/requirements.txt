@@ -1,0 +1,6 @@
+# Dev-machine deps to run the project Python tests (NOT the app build —
+# the APK gets these via Chaquopy). Mirror the on-device versions.
+numpy
+opencv-python==4.5.1.48
+stitching==0.6.1
+pytest

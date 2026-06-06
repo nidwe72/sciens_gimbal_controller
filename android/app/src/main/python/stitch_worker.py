@@ -1,12 +1,16 @@
 """On-device stitch worker, driven from Java via Chaquopy.
 
-`stitch()` runs the validated AffineStitcher(detector="sift", crop=False)
-recipe, but instead of the opaque high-level `.stitch()` call it walks the
-library's own pipeline step-by-step (the exact sequence from
-stitching.Stitcher.stitch) so it can report a monotonic [0,1] progress
-fraction between phases. The fractions are forwarded to the injected Java
-`ProgressReporter` (progress.report(double)), which pushes them onto the
-GraphQL `stitchEvents` subscription.
+`stitch()` builds one of three stitcher configs from the `projection` arg —
+  * "affine"      → AffineStitcher (demo mode: flat crops)
+  * "rectilinear" → Stitcher(warper_type="plane")   (live, looks like one lens)
+  * "spherical"   → Stitcher(warper_type="spherical")(live, wide >90° FOV)
+all with detector="sift", crop=False — then walks the library's own pipeline
+step-by-step (the exact sequence from stitching.Stitcher.stitch, shared by all
+three) so it can report a monotonic [0,1] progress fraction between phases.
+After the blend it applies the app's numba-free `crop_util.crop_to_content`
+to trim the rotational warp's black wedges. Progress fractions are forwarded
+to the injected Java `ProgressReporter`, which pushes them onto the GraphQL
+`stitchEvents` subscription.
 
 Pinned to stitching==0.6.1 (vendored under this python dir), so the step
 sequence is fixed. If `progress.report` raises (the Java side throws on
@@ -15,8 +19,10 @@ cancel), the exception propagates and aborts the stitch.
 
 import cv2
 
-from stitching import AffineStitcher
+from stitching import AffineStitcher, Stitcher
 from stitching.images import Images
+
+from crop_util import crop_to_content
 
 # Phase weights (cumulative). Mirror OpenPano's progress.txt feel:
 # features ~35, matching ~10, geometry ~15, warp ~20, blend ~20.
@@ -28,13 +34,25 @@ _AFTER_WARP = 0.85
 _AFTER_BLEND = 0.98
 
 
-def stitch(tile_paths, out_path, n_cols=0, progress=None):
+def _make_stitcher(projection):
+    proj = (projection or "affine").lower()
+    if proj == "affine":
+        return AffineStitcher(detector="sift", crop=False)
+    if proj == "rectilinear":
+        return Stitcher(detector="sift", warper_type="plane", crop=False)
+    if proj == "spherical":
+        return Stitcher(detector="sift", warper_type="spherical", crop=False)
+    raise ValueError(f"unknown projection: {projection!r}")
+
+
+def stitch(tile_paths, out_path, n_cols=0, progress=None, projection="affine"):
     """Stitch tile PNGs into a panorama written to out_path.
 
     Returns [width, height]. `tile_paths` is an iterable of paths: a Chaquopy
     `jarray` (Java String[], which supports Python's sequence protocol) on
     Android, or a plain Python list in local tests. `progress` is a Java
-    ProgressReporter-like object with `report(float)`, or None.
+    ProgressReporter-like object with `report(float)`, or None. `projection`
+    selects the stitcher (affine / rectilinear / spherical).
     """
     paths = [str(p) for p in tile_paths]
 
@@ -42,7 +60,7 @@ def stitch(tile_paths, out_path, n_cols=0, progress=None):
         if progress is not None:
             progress.report(float(frac))
 
-    s = AffineStitcher(detector="sift", crop=False)
+    s = _make_stitcher(projection)
 
     # --- mirror stitching.Stitcher.stitch(), reporting between phases ---
     s.images = Images.of(
@@ -83,6 +101,10 @@ def stitch(tile_paths, out_path, n_cols=0, progress=None):
     s.blend_images(imgs, seam_masks, corners)
     pano = s.create_final_panorama()
     report(_AFTER_BLEND)
+
+    # Numba-free crop to trim the warp's black wedges (near-noop for affine,
+    # which already fills the frame).
+    pano, _ = crop_to_content(pano)
 
     cv2.imwrite(out_path, pano)
     report(1.0)

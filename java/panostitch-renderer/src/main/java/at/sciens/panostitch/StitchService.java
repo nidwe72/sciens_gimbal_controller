@@ -83,7 +83,7 @@ public final class StitchService {
      * Materialise the uploaded tiles to a temp dir and submit the stitch.
      * Returns a stitchId immediately; the work runs on the single-flight worker.
      */
-    public String stitch(List<String> uploadIds, int nCols) {
+    public String stitch(List<String> uploadIds, int nCols, String projection) {
         String id = UUID.randomUUID().toString();
         AtomicBoolean cancel = new AtomicBoolean(false);
         cancels.put(id, cancel);
@@ -138,7 +138,7 @@ public final class StitchService {
                     events.offer(progressEvent(id, frac), 0L, TimeUnit.MILLISECONDS, null);
                 };
                 List<String> paths = tilePaths.stream().map(Path::toString).toList();
-                StitchOutcome out = engine.stitch(paths, nCols, overall);
+                StitchOutcome out = engine.stitch(paths, nCols, projection, overall);
                 r = Result.ok(out.png, out.width, out.height);
             } catch (CancellationException ce) {
                 r = Result.cancelled();

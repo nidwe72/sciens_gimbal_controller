@@ -12,7 +12,6 @@ public class MainActivity extends FlutterActivity {
         super.configureFlutterEngine(engine);
         new WifiNetworkChannel(this).register(engine);
         new NsdChannel(this).register(engine);
-        new StitchChannel(this).register(engine);
         new BackendChannel(this).register(engine);
     }
 }

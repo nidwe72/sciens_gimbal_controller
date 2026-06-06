@@ -44,7 +44,9 @@ public final class GraphQLEndpoint {
                             List<String> uploadIds = env.getArgument("uploadIds");
                             Object nColsArg = env.getArgument("nCols");
                             int nCols = nColsArg instanceof Number ? ((Number) nColsArg).intValue() : 0;
-                            return service.stitch(uploadIds, nCols);
+                            Object projArg = env.getArgument("projection");
+                            String projection = projArg != null ? projArg.toString() : "AFFINE";
+                            return service.stitch(uploadIds, nCols, projection);
                         })
                         .dataFetcher("cancel", env ->
                                 service.cancel(env.getArgument("stitchId"))))

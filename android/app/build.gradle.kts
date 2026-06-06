@@ -9,7 +9,6 @@ plugins {
 android {
     namespace = "at.sciens.gimbal_controller"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -19,17 +18,10 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-        }
-    }
-
     defaultConfig {
         applicationId = "at.sciens.gimbal_controller"
-        // OpenPano needs >= 21; cv2 4.5.1.48 wheel needs >= 24; Jetty 11
-        // (Javalin's server, used by the affine StitchMode) needs >= 26 — so
-        // the floor is 26 (matches petzvalStudio).
+        // cv2 4.5.1.48 wheel needs >= 24; Jetty 11 (Javalin's server) needs
+        // >= 26 — so the floor is 26 (matches petzvalStudio).
         minSdk = maxOf(flutter.minSdkVersion, 26)
         targetSdk = 33
         versionCode = flutter.versionCode
@@ -40,17 +32,6 @@ android {
         // Python wheels (numpy, cv2) for exactly these ABIs.
         ndk {
             abiFilters += listOf("arm64-v8a")
-        }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-                arguments += "-DANDROID_STL=c++_shared"
-                // Build the OpenPano stitch shim for arm64 only (the
-                // SCORP-control phone target). Flutter owns ndk.abiFilters,
-                // but this controls the native build directly.
-                abiFilters("arm64-v8a")
-            }
         }
     }
 

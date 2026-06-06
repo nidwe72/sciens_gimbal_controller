@@ -7,23 +7,21 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import '../camera/camera_connection.dart';
-import '../panorama/affine_server_stitcher.dart';
 import '../panorama/geometric_stitcher.dart';
 import '../panorama/panorama_grid.dart';
-import '../panorama/pano_stitcher.dart';
 import '../panorama/pano_tile_image.dart';
+import '../panorama/server_stitcher.dart';
 import 'gimbal_connection.dart';
 
 /// How the preview panorama is assembled.
 enum StitchMode {
-  /// Paste tiles at their known grid positions (flat, instant). Default.
-  geometric,
+  /// Flat geometric placement at the known grid positions — pure-Dart, instant.
+  simple,
 
-  /// OpenPano feature-stitch (corrects alignment, but spherical/slow).
-  openpano,
-
-  /// Affine feature-stitch via the in-process Python server (Chaquopy).
-  affine,
+  /// Feature-stitch via the in-process Python server (Chaquopy). The projection
+  /// (affine / rectilinear / spherical) is derived from demo-vs-live + focal.
+  /// Default.
+  advanced,
 }
 
 /// Overall run state. `done | cancelled | aborted` are terminal.
@@ -94,16 +92,25 @@ class PanoramaController extends ChangeNotifier {
   bool _cancelRequested = false;
 
   // --- Stitch-preview state (Phase 6 enhancement).
-  final PanoStitcher _stitcher = PanoStitcher();
-  final AffineServerStitcher _affineStitcher = AffineServerStitcher();
+  final ServerStitcher _serverStitcher = ServerStitcher();
 
-  /// Selected assembly mode (GUI-selectable). Default = geometric.
-  StitchMode _stitchMode = StitchMode.geometric;
+  /// Selected assembly mode (GUI-selectable). Default = advanced.
+  StitchMode _stitchMode = StitchMode.advanced;
   StitchMode get stitchMode => _stitchMode;
   void setStitchMode(StitchMode mode) {
     if (_stitchMode == mode || _stitching) return;
     _stitchMode = mode;
     notifyListeners();
+  }
+
+  /// Projection for the `advanced` server stitch (GraphQL `Projection` enum):
+  /// - demo → AFFINE (tiles are flat crops of one asset);
+  /// - live → rotational: RECTILINEAR for focalStitch ≥ 18 mm (≤~90° FOV, looks
+  ///   like one wide-angle lens), else SPHERICAL (15–18 mm, >90°).
+  String _projection() {
+    final isDemo = _ref.read(cameraConnectionProvider).isDemo;
+    if (isDemo) return 'AFFINE';
+    return _focalStitch >= 18 ? 'RECTILINEAR' : 'SPHERICAL';
   }
 
   bool _stitching = false;
@@ -353,13 +360,13 @@ class PanoramaController extends ChangeNotifier {
     _stitchError = null;
     _stitchProgress = null;
     _stitchStage =
-        _stitchMode == StitchMode.geometric ? 'Placing tiles…' : 'Preparing tiles…';
+        _stitchMode == StitchMode.simple ? 'Placing tiles…' : 'Preparing tiles…';
     notifyListeners();
 
     ui.Image? image;
     String? error;
-    if (_stitchMode == StitchMode.geometric) {
-      // Flat, deterministic, near-instant — no native call.
+    if (_stitchMode == StitchMode.simple) {
+      // Flat, deterministic, near-instant — pure Dart.
       try {
         image = await geometricStitch(_grid, _tileImages);
       } catch (e) {
@@ -375,11 +382,12 @@ class PanoramaController extends ChangeNotifier {
         }
       }
 
-      // affine → in-process Python server; openpano → native JNI.
-      final result = _stitchMode == StitchMode.affine
-          ? await _affineStitcher.stitch(ordered,
-              nCols: _grid.nCols, onStage: onStage)
-          : await _stitcher.stitch(ordered, nCols: _grid.nCols, onStage: onStage);
+      final result = await _serverStitcher.stitch(
+        ordered,
+        nCols: _grid.nCols,
+        projection: _projection(),
+        onStage: onStage,
+      );
       image = result.image;
       error = result.ok ? null : result.error;
     }

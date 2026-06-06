@@ -91,7 +91,7 @@ class _PanoTabState extends ConsumerState<PanoTab>
         _FocalSlider(
           label: 'Taking-lens focal',
           value: pano.focalTaking,
-          min: 50,
+          min: 28,
           max: 150,
           unit: 'mm',
           enabled: !locked,
@@ -102,7 +102,7 @@ class _PanoTabState extends ConsumerState<PanoTab>
         _FocalSlider(
           label: 'Stitched-image focal',
           value: pano.focalStitch,
-          min: 24,
+          min: 15,
           max: 100,
           unit: 'mm',
           enabled: !locked,
@@ -144,25 +144,20 @@ class _PanoTabState extends ConsumerState<PanoTab>
           currentIndex: pano.currentIndex,
         ),
         const SizedBox(height: 12),
-        // Phase 6 — assembly mode: Geometric (flat, instant) or OpenPano
-        // (feature-stitched, slower, spherical).
+        // Assembly mode: Simple (flat geometric placement, instant) or
+        // Advanced (feature-stitch via the in-process Python server).
         Center(
           child: SegmentedButton<StitchMode>(
             segments: const [
               ButtonSegment(
-                value: StitchMode.geometric,
-                label: Text('Geometric'),
+                value: StitchMode.simple,
+                label: Text('Simple'),
                 icon: Icon(Icons.grid_on),
               ),
               ButtonSegment(
-                value: StitchMode.openpano,
-                label: Text('OpenPano'),
+                value: StitchMode.advanced,
+                label: Text('Advanced'),
                 icon: Icon(Icons.auto_awesome),
-              ),
-              ButtonSegment(
-                value: StitchMode.affine,
-                label: Text('Affine'),
-                icon: Icon(Icons.dashboard_customize),
               ),
             ],
             selected: {pano.stitchMode},

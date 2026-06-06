@@ -14,15 +14,16 @@ public interface StitchEngine {
     /**
      * Stitch tiles into a single panorama.
      *
-     * @param tilePaths absolute paths to tile PNGs, in stitch order
-     * @param nCols     grid column count (hint; {@code <= 0} if unknown)
-     * @param progress  called with monotonic [0,1] fractions as the pipeline
-     *                  advances. The implementation should call it between
-     *                  pipeline steps; if it throws (e.g. on cancel) the engine
-     *                  must let the exception propagate.
+     * @param tilePaths  absolute paths to tile PNGs, in stitch order
+     * @param nCols      grid column count (hint; {@code <= 0} if unknown)
+     * @param projection AFFINE / RECTILINEAR / SPHERICAL (the GraphQL enum name)
+     * @param progress   called with monotonic [0,1] fractions as the pipeline
+     *                   advances. The implementation should call it between
+     *                   pipeline steps; if it throws (e.g. on cancel) the engine
+     *                   must let the exception propagate.
      * @return the stitched panorama as PNG bytes + dimensions
      * @throws Exception on any stitch failure (surfaced to the client as FAILED)
      */
-    StitchOutcome stitch(List<String> tilePaths, int nCols, ProgressReporter progress)
-            throws Exception;
+    StitchOutcome stitch(List<String> tilePaths, int nCols, String projection,
+                         ProgressReporter progress) throws Exception;
 }

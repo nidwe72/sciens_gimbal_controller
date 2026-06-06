@@ -44,9 +44,13 @@ public final class ChaquopyStitchEngine implements StitchEngine {
 
     @Override
     public StitchOutcome stitch(List<String> tilePaths, int nCols,
-                                ProgressReporter progress) throws Exception {
+                                String projection, ProgressReporter progress)
+            throws Exception {
         Python py = Python.getInstance();
         PyObject worker = py.getModule("stitch_worker");
+        // GraphQL enum name (AFFINE/RECTILINEAR/SPHERICAL) -> worker's
+        // lowercase projection key.
+        String proj = (projection == null ? "affine" : projection).toLowerCase();
 
         // Pass a Java String[] — Chaquopy maps Java *arrays* to a `jarray` that
         // supports Python's full sequence protocol (iteration, len, indexing),
@@ -63,7 +67,7 @@ public final class ChaquopyStitchEngine implements StitchEngine {
             // its report(double) directly via Chaquopy.
             PyObject dims = worker.callAttr(
                     "stitch", paths, out.getAbsolutePath(), nCols,
-                    new PyProgress(progress));
+                    new PyProgress(progress), proj);
             List<PyObject> wh = dims.asList();
             int width = wh.get(0).toInt();
             int height = wh.get(1).toInt();

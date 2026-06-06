@@ -23,10 +23,21 @@ type Mutation {
   and the terminal result arrive via the `stitchEvents` subscription, and the
   stitched PNG is fetched from GET /result/{stitchId}.
   """
-  stitch(uploadIds: [ID!]!, nCols: Int): ID!
+  stitch(uploadIds: [ID!]!, nCols: Int, projection: Projection): ID!
 
   "Ask an in-flight stitch to stop at the next step boundary."
   cancel(stitchId: ID!): Boolean!
+}
+
+"""
+Which stitcher the worker builds. AFFINE = flat demo crops; RECTILINEAR =
+rotational + planar projection (looks like one wide-angle lens, ≤~90° FOV);
+SPHERICAL = rotational + spherical (wider FOV). Defaults to AFFINE.
+"""
+enum Projection {
+  AFFINE
+  RECTILINEAR
+  SPHERICAL
 }
 
 type Subscription {
