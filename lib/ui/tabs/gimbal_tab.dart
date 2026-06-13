@@ -6,6 +6,7 @@ import '../../state/gimbal_connection.dart';
 import '../../state/panorama_controller.dart';
 import '../gimbal_visualization.dart';
 import 'logs_tab.dart';
+import 'parallax_calibration_tab.dart';
 
 /// First Playground tab. Hosts the 3D visualization (top) plus the
 /// orientation status line and the pan/tilt/level controls. Uses
@@ -46,12 +47,13 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
         ref.watch(panoramaControllerProvider.select((c) => c.running));
 
     return DefaultTabController(
-      length: 2,
+      length: 3,
       child: Column(
         children: [
           const TabBar(
             tabs: [
               Tab(text: 'Control'),
+              Tab(text: 'Parallax'),
               Tab(text: 'Logs'),
             ],
           ),
@@ -59,6 +61,7 @@ class _GimbalTabState extends ConsumerState<GimbalTab>
             child: TabBarView(
               children: [
                 _gimbalBody(conn, panoRunning),
+                const ParallaxCalibrationTab(),
                 const LogsTab(),
               ],
             ),

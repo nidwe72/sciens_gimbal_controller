@@ -4898,84 +4898,458 @@ pending — needs hardware).
 - Persisting / exporting the preview pano (view-only for now; export
   could tie into the Phase 5 hand-off later).
 
-## Phase 7 — Affine stitch (Python / Chaquopy server)
+## Phase 7 — Python/Chaquopy stitch server (as built; Phase 8 = mode simplification)
 
-A **third `StitchMode`** (`affine`) alongside `geometric` and `openpano`.
-Geometric and OpenPano are unchanged; affine is the path we intend to
-eventually replace OpenPano with. It runs the Python
-[`stitching`](https://pypi.org/project/stitching/) library's
-`AffineStitcher` (a thin wrapper over OpenCV's `stitching_detailed`) which —
-evaluated against the demo crops — reconstructs the source far better than
-OpenPano (16/16 tiles, output ≈ the original frame). It is the correct model
-for the demo tiles, which are translation/scale-related crops of one flat
-asset (no perspective).
+Stitching runs on a **single backend**: an in-process Python stitcher reached
+over localhost HTTP/GraphQL — the architecture adopted from the sibling
+`petzvalStudio` project. *Android-only for now*; the GraphQL pattern is kept so
+other targets can follow with one design. It runs the Python
+[`stitching`](https://pypi.org/project/stitching/) library (a thin wrapper over
+OpenCV's `stitching_detailed`).
 
-**Architecture (adopted from the sibling `petzvalStudio` project).** Flutter
-talks to an **in-process backend** over localhost HTTP/GraphQL, exactly as
-petzvalStudio does — *Android-only for now*, but the GraphQL pattern is kept
-so other targets can follow with one design.
+**Two user modes (Phase 8), one backend.** `StitchMode {geometric, openpano,
+affine}` collapsed to **`{simple, advanced}`**; OpenPano and all its C++/JNI
+were removed.
+- **Simple** — pure-Dart `geometricStitch()`: flat placement at the known grid
+  positions, instant.
+- **Advanced** (default) — the Python server stitch. The **projection is
+  auto-derived, no user choice** (controller `_projection()`):
+  - **demo** → `AFFINE` (tiles are flat crops of one asset → `AffineStitcher`);
+  - **live** → rotational: **`RECTILINEAR`** (`warper_type="plane"`) for
+    `focalStitch ≥ 18 mm` (≤~90° FOV → looks like one wide-angle lens), else
+    **`SPHERICAL`** for 15–18 mm (>90°, where rectilinear edges blow up).
 
 ```
 Flutter (Dart)                Java (in-process)            Python (Chaquopy)
 ─────────────                 ─────────────────            ─────────────────
-AffineServerStitcher          panostitch-renderer.jar      stitch_worker.py
-  POST /upload  (tiles)  ──▶   Javalin + graphql-java   ──▶  AffineStitcher
-  mutation stitch        ──▶   StitchService (1-flight)      (sift, crop=False)
-  WS stitchEvents (progress)◀─ ProgressReporter        ◀──  progress.report()
-  GET /result/{id}       ──▶   StitchEngine (injected)
+ServerStitcher                :panostitch-renderer          stitch_worker.py
+  POST /upload  (tiles)  ──▶   Javalin + graphql-java   ──▶  AffineStitcher /
+  mutation stitch(…,proj)──▶   StitchService (1-flight)      Stitcher(plane) /
+  WS stitchEvents (progress)◀─ ProgressReporter        ◀──  Stitcher(spherical)
+  GET /result/{id}       ──▶   StitchEngine (injected)       + crop_to_content
 ```
 
-- **Backend jar** — `java/panostitch-renderer/` (Maven, package
-  `at.sciens.panostitch`), a **fork** of petzvalStudio's `petzval-renderer`
-  stripped to the transport core: `Main` (Javalin boot), `GraphQLEndpoint`,
-  `GraphQLWsHandler` (graphql-transport-ws), `StitchService` (single-flight
-  worker + `SubmissionPublisher` event channel), `ProgressReporter`. **No
-  JavaCV** — the jar has no image stack; it delegates the stitch to an
-  injected `StitchEngine`. Built with `mvn package` → thin
-  `android/app/libs/panostitch-renderer.jar`; the heavy deps (Javalin 6.3.0,
-  graphql-java 22.3, jackson, reactive-streams, slf4j) come via Gradle.
-- **GraphQL surface** — `stitch(uploadIds:[ID!]!, nCols:Int): ID!` mutation,
+- **Backend** — `java/panostitch-renderer/`, package `at.sciens.panostitch`, a
+  fork of petzvalStudio's `petzval-renderer` stripped to the transport core
+  (`Main`/Javalin, `GraphQLEndpoint`, `GraphQLWsHandler` graphql-transport-ws,
+  `StitchService` single-flight worker + `SubmissionPublisher`,
+  `ProgressReporter`). **No JavaCV** — it delegates the stitch to an injected
+  `StitchEngine`. Built **from source as a Gradle `java-library` subproject**
+  (`implementation(project(":panostitch-renderer"))`, included from
+  `android/settings.gradle.kts`) — **no committed jar**; Javalin 6.3.0 /
+  graphql-java 22.3 / jackson / reactive-streams / slf4j are its `api` deps.
+- **GraphQL surface** — `stitch(uploadIds:[ID!]!, nCols:Int, projection:
+  Projection): ID!` (`enum Projection {AFFINE RECTILINEAR SPHERICAL}`),
   `stitchEvents(stitchId:ID!): StitchEvent!` subscription, `cancel`. Image
-  bytes go out-of-band: tiles up via `POST /upload` (one per call), the
-  panorama PNG down via `GET /result/{stitchId}`.
+  bytes go out-of-band: tiles up via `POST /upload`, panorama PNG down via
+  `GET /result/{stitchId}`.
 - **Boot** — `BackendChannel.java` starts Chaquopy + `Main.start(0, engine)`
-  in-process at app launch (eager — "boot at app start") on `127.0.0.1`, and
-  hands the OS-assigned port to Dart over the
-  `at.sciens.gimbal_controller/backend` MethodChannel (`getBackendPort`).
-- **StitchEngine** — `ChaquopyStitchEngine` (in the app, where Chaquopy's API
-  is visible) calls the Python worker via Chaquopy. It passes tile paths as a
-  Java `String[]` (Chaquopy maps arrays to an iterable `jarray`; Java
-  collections are *not* iterable from Python) and a `PyProgress` adapter
-  (a public class wrapping the `ProgressReporter` lambda).
-- **Python worker** — `android/app/src/main/python/stitch_worker.py` walks
-  the `Stitcher` pipeline step-by-step (mirrors `stitching.Stitcher.stitch`)
-  so it can emit a monotonic progress fraction between phases
-  (features 0.35 / matching 0.45 / geometry 0.60 / seams 0.70 / warp 0.85 /
-  blend 0.98 / 1.0). `stitching` is **vendored** alongside it (pure Python);
-  `numpy` + `opencv-python==4.5.1.48` come from Chaquopy's pip. `crop=False`
-  keeps `largestinteriorrectangle` (numba — no Android wheel) out of the
-  import path.
-- **Dart client** — `lib/panorama/affine_server_stitcher.dart` mirrors
-  `PanoStitcher`'s `stitch(...) → StitchResult` shape, so the controller
-  branch and the existing progress UI are unchanged. The `stitchEvents` WS
-  subscription drives the progress bar; `GET /result` (which blocks until
-  done) delivers the bytes.
+  in-process at app launch on `127.0.0.1`, handing the OS-assigned port to Dart
+  over the `at.sciens.gimbal_controller/backend` MethodChannel (`getBackendPort`).
+- **StitchEngine** — `ChaquopyStitchEngine` calls the Python worker via
+  Chaquopy: tile paths as a Java `String[]` (Chaquopy maps arrays to an
+  iterable `jarray`; Java collections are *not* iterable from Python), a
+  `PyProgress` adapter (public class wrapping the `ProgressReporter` lambda),
+  and the projection (lowercased).
+- **Python worker** — `android/app/src/main/python/stitch_worker.py` builds the
+  stitcher from `projection` and walks the `Stitcher` pipeline step-by-step
+  (mirrors `stitching.Stitcher.stitch`, shared by all three) to emit monotonic
+  progress (features .35 / matching .45 / geometry .60 / seams .70 / warp .85 /
+  blend .98 / 1.0). `stitching` **vendored**; numpy + opencv-python==4.5.1.48
+  via Chaquopy pip. All stitchers run `crop=False`.
+- **Crop** — `crop_util.crop_to_content` (shipped: pure-numpy
+  largest-interior-rectangle + a small morphological close) trims the
+  rotational warp's black wedges after the blend. Avoids numba (no Android
+  wheel) *and* the library's buggy `crop=True`. Near-noop for the demo (it
+  already fills the frame).
+- **Dart client** — `lib/panorama/server_stitcher.dart` (`ServerStitcher`),
+  same `stitch(...) → StitchResult` shape the simple path's caller expects.
+  The `stitchEvents` WS subscription drives the progress bar; `GET /result`
+  (blocks until done) delivers the bytes.
+- **Focal limits** — taking-lens **28–150 mm**, stitched-image **15–100 mm**
+  (`focalStitch ≤ focalTaking` clamp unchanged).
 
-**Packaging deltas (real costs of the affine mode).**
-- **`minSdk` 21 → 26** — cv2's wheel needs API 24, Jetty 11 (Javalin's
-  server) needs API 26; the floor is 26.
-- **`isCoreLibraryDesugaringEnabled = true` + `multiDexEnabled = true`** —
-  required, or Jetty/graphql-java fail to dex (matches petzvalStudio).
-- **APK ≈ +90 MB** — CPython 3.10 + numpy + cv2 (+ openblas/libjpeg/…) ≈
-  60 MB, plus Jetty + graphql-java.
+**Packaging deltas.**
+- `minSdk` 21 → **26** (cv2 wheel needs 24, Jetty 11 needs 26).
+- `isCoreLibraryDesugaringEnabled` + `multiDexEnabled` required (else Jetty /
+  graphql-java fail to dex).
+- APK ≈ **+90 MB** (CPython 3.10 + numpy + cv2 + openblas/libjpeg + Jetty +
+  graphql-java).
+- OpenPano removal drops `libpanostitch.so`; the app is now **NDK/C++-free**
+  (no `cpp/`, no `externalNativeBuild`/cmake/`ndkVersion`).
 
-**Verification (2026-06-05).** Eval harness (outside the app) confirmed the
-affine recipe; the Chaquopy packaging + on-device run were proven with a
-standalone spike; `flutter build apk` packages the whole chain; the affine
-StitchMode produces the panorama on a real arm64 device.
+### Phase 7–8 — Definition of Done (on-device verified 2026-06-06)
 
-**Roadmap note.** OpenPano (`openpano` mode + its C++/JNI) stays for now and
-is slated for removal once affine is proven in the field.
+- [x] Single stitch backend (Python/Chaquopy server); OpenPano + all C++/JNI
+      removed; app builds NDK-free (no `libpanostitch.so`).
+- [x] Modes reduced to **Simple / Advanced** (advanced default); no projection
+      picker — projection auto-derived from demo-vs-live + `focalStitch`.
+- [x] **Simple** → instant flat geometric placement.
+- [x] **Advanced + demo** → `AFFINE`, full-frame result.
+- [x] **Advanced + live** → rotational; `RECTILINEAR` ≥18 mm else `SPHERICAL`;
+      cropped to a clean rectangle (no large black region).
+- [x] Live progress bar driven by the `stitchEvents` subscription.
+- [x] Numba-free crop, guarded by `python_test/test_stitch_crop.py` (planar +
+      spherical on the Hugin fixtures, fill ≥ 0.99).
+- [x] Focal floors: taking 28 mm / stitch 15 mm.
+- [x] `flutter analyze` clean; `flutter build apk` green; **runs on a real
+      arm64 device as expected** (commit `851afdd` "Phase 8", 2026-06-06).
+
+**Eval harness** (research, outside the app): `/home/nidwe72/development/
+feiyutech/stitching_eval` — validated affine (demo), spherical/cylindrical
+(zijing 260°), grid (aligntogrid), multi-row (hugin), rectilinear vs FOV, and
+the numba-free crop across all datasets.
+
+## Phase 9 — Parallax calibration (no-parallax-point finder)
+
+### Goal
+
+A new third sub-tab under the **Gimbal** tab — **Control | Parallax Calibration
+| Logs** — that helps the user find the **no-parallax point (NPP)** of a taking
+lens: the fore/aft position on the nodal-slide rail where the lens entrance
+pupil sits on the gimbal's pan axis, so panning introduces no parallax. This is
+a prerequisite for the multi-row Brenizer panoramas of Phase 4 — at the NPP a
+single homography relates two panned frames at *every* depth, so the tiles stitch
+without breaking near/far edges.
+
+Primary use: a **one-time, pre-shoot calibration per taking lens** (the rig is a
+historical Berthiot Périgraphe rectilinear, ~90 mm, on a Lumix S5). The user
+records the winning rail-mm value and dials it in blind on location.
+
+### Principle (and the one subtlety)
+
+When the camera rotates about the entrance pupil, the two frames are an exact
+homography for all depths. Off the NPP, near and far objects shift by different
+amounts (parallax) and no single homography fits both. So the **metric of
+fidelity = how well the background's homography also explains the foreground**.
+
+Subtlety that drives the whole design: if you feed *all* matches into one
+`findHomography`+RANSAC, RANSAC happily keeps the background as inliers and
+discards the foreground as outliers — reporting a perfect fit while hiding the
+parallax. The signal only survives if foreground and background are **separated
+first** and the metric is **asymmetric**: fit H to the background only, then
+measure the *foreground* residual under that H. That residual (in px) is what the
+user minimises.
+
+### Physical setup (worked Graz example)
+
+Two depth-separated targets, both near frame centre and overlapping vertically:
+
+- **Foreground:** a matte silicone **chessboard, 45 × 45 cm** (fixed, known size)
+  on a stand at ~3 m. Matte = no specular highlights to blind corner detection.
+- **Background:** a fixed **bronze sea-figure** on the Graz Tegetthoff monument at
+  ~12–15 m (patinated bronze is feature-rich; sits clear of the foreground).
+- **Lens/camera:** 90 mm, **landscape only** (S5 full-frame 36×24 → HFOV ≈ 22.6°,
+  VFOV ≈ 15.2°), focus fixed on the figure (background), **f/16** so the
+  out-of-focus foreground still yields hard corners.
+- **Pan:** small symmetric swing (≈ ±5°, computed — see heuristic), so both
+  targets stay framed in both shots while still provoking measurable parallax.
+
+The depth ratio (~1:4) is the sweet spot: a 1–2 mm rail error already shifts the
+board visibly against the figure.
+
+### Degrees of freedom — just focal length
+
+Board size is a configured constant (45 cm); the figure is fixed. The **only
+mandatory user input is the taking-lens focal length** (the adapted Berthiot
+carries no EXIF). Everything else is *measured from the images*:
+
+- **fg distance** — derived from the detected board's pixel width + known 45 cm +
+  focal: `d_fg = f_px · 0.45 / px_width`. Not entered.
+- **target angular widths** (for framing/Δ) — measured pixel extents (board from
+  corner detection, figure from its ROI). No distance needed for the pan angle.
+- **bg distance** — optional rough estimate, only refines the parallax-gain
+  readout (figure at 15 m vs ∞ moves the gain ~20%); defaults and is ignorable.
+
+Reuse the Phase 4 `_FocalSlider` widget (28–150 mm), defaulting to the pano
+taking-focal if set.
+
+### Capture & auto-pan heuristic
+
+Auto-pan is computed, not hard-coded, balancing two pressures:
+
+- **Signal grows with Δ:** rotating by Δ about an axis offset `e` from the pupil
+  swings the pupil on a baseline ≈ `e·sinΔ`; a point at depth `d` then shifts on
+  sensor by ≈ `f_px·e·sinΔ/d`. The differential fg-vs-bg shift (the metric) ≈
+  `f_px · e · sinΔ · (1/d_fg − 1/d_bg)` → larger Δ, more signal.
+- **Framing caps Δ:** the 45 cm board at 3 m subtends ≈ 9.5° — most of the 22.6°
+  HFOV — so the *board's* angular width is the binding constraint, not a point.
+
+Heuristic (inputs: focal, sensor 36×24 landscape, measured angular extents):
+
+1. `HFOV = 2·atan(sensor_w / 2f)`.
+2. per target `θ = atan(width/2 / distance)` (from measured pixel extents).
+3. `Δ_max = HFOV/2 − max(θ_fg, θ_bg) − margin` (margin keeps targets inside the
+   inner ~80% of frame). Capture **symmetrically at ±Δ_max/2**.
+4. Report a **parallax gain** = `f_px · sinΔ · (1/d_fg − 1/d_bg)` in *px of
+   residual per mm of rail error* — tells the user up front whether the geometry
+   resolves sub-mm slides; **warn** if the setup is weak (depths too similar) or
+   `Δ_max ≤ 0` (board too big/close to frame both — step back or move the board).
+
+First pair has no image to measure, so Δ for shot #1 uses an analytic estimate
+(focal + 45 cm + default `d_fg≈3 m`); a **metering frame** (one preview shot:
+detect board, box the figure) then recomputes Δ for the real ±Δ/2 pair.
+
+Pan sequence reuses the closed-loop joystick (`GimbalSession.moveByAngle`):
+`moveByAngle(−Δ/2)` → **capture A** → `moveByAngle(+Δ)` → **capture B** →
+`moveByAngle(−Δ/2)` home. Each move is awaited and **must return
+`MoveResult.completed`** before capturing; on stall/timeout the pair is aborted
+with a message.
+
+### CV pipeline (Java / OpenCV Android SDK)
+
+Java is purely the **analysis engine**: input = two `Uint8List` frames + the
+background ROI + params; output = a metric JSON. It never renders or captures.
+
+1. **Downscale** both frames to 1000-px width (normalises the metric to a
+   device-independent scale and speeds everything up).
+2. **Foreground (chessboard)** — `Calib3d.findChessboardCornersSB` locates and
+   *orders* the inner corners in both A and B at sub-pixel accuracy. Correspondence
+   is direct (corner *i* ↔ corner *i*); **no box, no GrabCut, no feature matching,
+   no ML** needed for the board.
+3. **Background (figure)** — one user-drawn ROI box → `Imgproc.grabCut` mask →
+   `ORB`/`SIFT` features inside the mask → `BFMatcher` A↔B.
+4. **Background homography** — `Calib3d.findHomography(bg_A, bg_B, RANSAC)` = H.
+5. **Foreground residual** — `Core.perspectiveTransform(board_A, H)` vs the actual
+   `board_B`; mean Euclidean distance over corners = the residual (px @ 1000-px).
+6. **Direction (free):** sign of the mean residual's horizontal component vs the
+   pan direction tells whether the pupil is ahead of or behind the pan axis → a
+   **front/back arrow** ("slide forward" / "slide back").
+
+**Output to the user:** the number (e.g. `1.4 px`) + a **traffic light** —
+🔴 > 15 · 🟡 3–15 · 🟢 < 3 (px on the 1000-px scale) — + the front/back arrow.
+The result object carries optional `slideMm` / `partLabel` slots (unused in v1;
+see Deferred).
+
+### Demo mode (renders the pair in Dart; doubles as the test oracle)
+
+Calibration must be exercisable with the demo gimbal + virtual Lumix S5, with no
+hardware. There is **no AI/photo image** — the pair is rendered parametrically:
+
+- A two-plane scene — analytic **chessboard** at `d_fg` + a **vector (SVG)
+  figure** at `d_bg` (the figure must be *detailed* — folds, face, trident, base —
+  so the demo "background" yields enough features; a flat silhouette won't).
+- Given a virtual **rail error `e`**, Δ, focal and the two depths, each plane's
+  inter-view mapping is the exact homography `H = K(R − t·nᵀ/d)K⁻¹` with
+  `t = (R(Δ)−I)·[0,0,e]ᵀ`. Rendered in Dart via `Canvas.transform` (Matrix4
+  perspective) → two JPEGs fed to the *same* Java engine as a real capture.
+- The UI exposes a **virtual-rail slider (`e` in mm)**; drag it, re-shoot, watch
+  the metric go 🟢 at `e≈0`. The whole loop, no rig.
+- **Oracle:** feed a synthetic pair with known `e`; assert the measured residual
+  and the front/back sign match the analytic prediction. This validates the
+  **plumbing and the direction logic** — *not* optical truth, which is only
+  provable on the physical rig.
+
+### Help / explainer animation (pure Flutter, no CV)
+
+An info icon on the sub-tab opens a modal sheet (`showModalBottomSheet`, per
+`header.dart:130`) with a **geometric, CV-free** animated teacher — a
+`CustomPainter` + `AnimationController` driven by the same `e`/Δ/depth params.
+Two stacked panels (bird's-eye geometry + viewfinder consequence), a traffic
+light, and an interaction strip.
+
+Legend: `★` far figure · `▣` near board · `◉` entrance pupil · `+` pan axis
+(fixed pivot) · `╲ ╱` sight-lines from the pupil.
+
+**Static layout / chrome**
+
+```
+┌──────────────────────────────────────────────┐
+│  Why the no-parallax point matters       (ⓘ)  │
+│  ┌──────────────────────────────────────────┐ │
+│  │  BIRD'S-EYE  (top-down: subject is "up")  │ │  ← panel 1: the geometry
+│  └──────────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────────┐ │
+│  │  VIEWFINDER  (what the sensor sees)       │ │  ← panel 2: the consequence
+│  └──────────────────────────────────────────┘ │
+│   ▶/⏸  rail e ▕────●────▏  near ▕──●──▏ far ▕─●─▏│  ← play/stop + distance sliders
+│        🟢  0.0 px        (no shift)            │  ← live light + readout
+└──────────────────────────────────────────────┘
+```
+
+**State 1 — EXACT (pupil on the pan axis).** Pupil pivots in place; near + far
+stay on one sight-line, so the board never moves relative to the figure.
+
+```
+ BIRD'S-EYE              … as it pans left ↔ right …
+     ★                       ★              ★
+     ┊                       ┊               ┊
+     ▣                       ▣               ▣
+     ┊                      ╱                 ╲
+   ◉≡+  ← pupil ON axis   ◉≡+               ◉≡+
+ (◉ and + coincide; spins in place — no sideways travel)
+
+ VIEWFINDER       pan-left          pan-right
+                ┌──────────┐      ┌──────────┐
+                │ ★        │      │        ★ │
+                │ ▣        │      │        ▣ │   ▣ glued under ★
+                └──────────┘      └──────────┘   🟢  0.0 px
+```
+
+**State 2 — Too far BACK (pupil behind the axis).** Pupil orbits the axis →
+travels sideways; the near board lags the far figure and they scissor apart.
+
+```
+ BIRD'S-EYE            … pan left        … pan right
+     ★                    ★                  ★
+     ┊                    ┊                   ┊
+     ▣                    ▣                   ▣
+    ╱                    ╱ ◉ ← swung right    ◉ ╲
+   ◉   ← pupil OFFSET   ◉                      ◉
+    ╲                    ╲                    ╱
+     +  ← axis behind     +                  +
+ (◉ orbits +, shifts sideways → near-object parallax)
+
+ VIEWFINDER       pan-left          pan-right
+                ┌──────────┐      ┌──────────┐
+                │ ★        │      │        ★ │
+                │    ▣     │      │     ▣    │   board drifts OPPOSITE to ★
+                └──────────┘      └──────────┘   🔴 18 px  ◀ slide FORWARD
+```
+
+**State 3 — Too far FORWARD (pupil ahead of the axis).** Same break-up, board
+drifts the other way — the sign that flips the slide arrow.
+
+```
+ VIEWFINDER       pan-left          pan-right
+                ┌──────────┐      ┌──────────┐
+                │ ★        │      │        ★ │
+                │▣         │      │         ▣│   board LEADS ★ (mirror of State 2)
+                └──────────┘      └──────────┘   🔴 18 px  ▶ slide BACK
+```
+
+**What animates (the loop).** One `AnimationController` drives the **pan angle**
+as a slow left↔right sine sweep (~2 s/cycle); both panels redraw from it. In the
+bird's-eye, the **pupil `◉` and sight-lines** move while the axis `+` stays fixed
+(EXACT: `◉` only rotates; off-NPP: `◉` visibly orbits `+`). In the viewfinder,
+`★` and `▣` translate together; their **relative** gap is zero (EXACT) or opens
+and closes with the sweep (off-NPP), residual arrows scaling to the gap. The
+**light + px + front/back arrow** update continuously.
+
+**Interactive (default playing).** Per-default the animation **plays** as a
+self-running teacher — the pan sweeps *and* it walks `e` through
+back → exact → forward on a loop, so a user who does not want to fiddle just
+watches. A **▶/⏸ play/stop button** freezes the auto-loop and hands the user the
+controls: draggable sliders for the free **rail offset `e`** (the gimbal-bracket
+y-distance) and the **near / far target distances** — scrub them and the geometry,
+viewfinder, light and arrow update live (the pan can be hand-scrubbed or held).
+Stop = explore the distances yourself; Play = sit back. All controls feed the
+same `e`/Δ/depth params as the real demo renderer, so teacher and metric stay
+consistent.
+
+**`e` is the primary control.** The rail offset `e` is the star of the lesson —
+it is what flips back/exact/forward and what the user actually adjusts on the rig.
+The near/far distances are *secondary*: they only rescale how fast the scissoring
+grows.
+
+#### As built (PR 9.1, 2026-06-13)
+
+`lib/ui/parallax/parallax_explainer.dart` (the animation) + `lib/ui/tabs/
+parallax_calibration_tab.dart` (sub-tab body with a "How it works" button →
+`showModalBottomSheet`). `gimbal_tab.dart` is now `DefaultTabController(length: 3)`
+→ **Control | Parallax | Logs**. Deviations from the sketch above, settled in
+review (the ASCII frames remain the conceptual model — `★`/`▣` are shorthand for
+the drawn figure/chessboard, and `e` is now surfaced as **ΔY**):
+
+- **Layout:** each row is split **60% animation / 40% loupe** (not stacked-only).
+  Two loupes: a **nodal-point loupe** (bird's-eye) magnifying the pupil sliding
+  fore/aft along the optical axis as ΔY changes (and orbiting the axis cross as it
+  pans), showing the live `ΔY = … mm`; and a **chessboard-vs-figure-axis loupe**
+  (viewfinder) magnifying the board's drift against a fat black "figure axis".
+- **Manual control = three presets only** (Too far back / Correct (NPP) / Too far
+  forward) — no fine slider. ▶/⏸ toggles auto-cycle ↔ frozen-manual; **both panels
+  always animate** (pan never stops).
+- **Glyphs:** figure drawn as a person, chessboard a **5×5** checker, both sized to
+  their true apparent ratio from real dims (figure 3 m tall, board 45 cm wide).
+- **Labels split by meaning:** bird's-eye annotates **distances** (figure, camera),
+  viewfinder annotates **dimensions** (tall / wide). The chessboard is entered as an
+  **offset *ahead of the figure*** (default 5 m → board at 10 m for a 15 m figure);
+  its absolute camera distance is derived and shown in the bird's-eye.
+- The traffic light tints the chessboard in **both** views. Pan ≈ 6 s/sweep.
+- **Illustrative metric gain (×8)** so the green→red bands span the preset range —
+  the px number is teaching-only (the real metric is PR 9.4).
+
+### UI
+
+Third sub-tab in `gimbal_tab.dart` (today `DefaultTabController(length: 2)` at
+`gimbal_tab.dart:48`): **Control | Parallax Calibration | Logs**. The calibration
+body: focal input, "Run pair" button (auto-pan + capture, or virtual slider in
+demo), the metering/Δ + parallax-gain readout, the big result (number + light +
+arrow), and the info icon. No persistence in v1 — the user notes the rail mm
+themselves.
+
+### Architecture seam
+
+- **`org.opencv` (OpenCV Android SDK, ~4.11)** added to `app/build.gradle.kts`;
+  coexists in-process with the Chaquopy-bundled cv2 (different `.so`s). First step
+  of the CV PR proves `OpenCVLoader.initLocal()` + ABI/APK size before any pipeline.
+- New **`ParallaxChannel.java`** (channel `at.sciens.gimbal_controller/parallax`),
+  registered in `MainActivity.configureFlutterEngine` next to `BackendChannel`.
+- Capture reuses the Phase 8 single-shot path (`camera_connection` → `Uint8List`);
+  pan reuses `GimbalSession.moveByAngle`. Demo render is new Dart code.
+- New `assets/parallax/` (figure SVG); `flutter_svg` already a dep.
+
+### Implementation phases (PR breakdown)
+
+Ordered so each PR is independently testable; the **explainer animation ships
+first** (pure Flutter, no deps, crystallises the concept).
+
+| PR | Title | Scope | Deps / risk | Verification |
+|----|-------|-------|-------------|--------------|
+| **9.1 ✓** | **Explainer animation** *(built 2026-06-13)* | CV-free `CustomPainter` + `AnimationController` teacher; each row split 60% animation / 40% loupe (nodal-point loupe shows live ΔY; chessboard-vs-figure-axis loupe); ΔY via three presets (no slider), ▶/⏸ auto-cycle↔manual, both panels always animate; person + 5×5 chessboard sized to real dims; "How it works" modal sheet | none — pure Flutter | ✓ `flutter analyze` clean, debug APK builds; on-device: auto-loop walks back→exact→forward, presets drive light 🟢→🔴, loupes show ΔY + board drift |
+| 9.2 | Sub-tab shell + focal input | Third tab Control \| Parallax \| Logs; reuse `_FocalSlider`; result widgets (number + 🔴🟡🟢 + arrow) wired to a stub metric | none | tab appears only when gimbal connected; stub metric renders |
+| 9.3 | OpenCV SDK + channel skeleton | Add `org.opencv`; `ParallaxChannel`; prove `OpenCVLoader.initLocal()` + a trivial round-trip | **OpenCV/Chaquopy coexistence; APK +size; ABI filters** | app builds + loads OpenCV on arm64 device; APK size logged; round-trip returns |
+| 9.4 | CV analysis engine | Java: downscale → board corners → ROI/GrabCut → features/match → bg homography → fg residual → normalize → metric JSON (+ direction sign) | depends 9.3 | unit-tested on a bundled fixture pair; residual + sign correct |
+| 9.5 | Demo renderer + virtual rail | Dart two-plane homography render (chessboard + SVG figure); virtual-rail `e` slider; wire demo pair → 9.4 → live metric | depends 9.4; needs detailed figure SVG | dragging `e` drives the light 🟢 at 0; **oracle test** (measured ≈ analytic) green |
+| 9.6 | Auto-pan + real capture | Metering frame → Δ heuristic + gain readout + warnings; symmetric ±Δ/2 capture via `moveByAngle` (await `completed`) + real capture | depends 9.4; gimbal + camera | on-rig: a pair runs, residual drops to 🟢 as the slide is tuned to NPP |
+| 9.7 | Polish | Front/back arrow copy, weak-setup / `Δ_max≤0` warnings, error paths (move stall, board-not-found, too-few bg features) | — | graceful messages on each failure; `flutter analyze` clean |
+
+### Verification checkpoints (Phase 9)
+
+- [x] Explainer animation conveys *why* parallax appears for back / exact / forward.
+- [ ] Demo: dragging the virtual rail drives 🔴→🟢 at `e≈0`; oracle test passes.
+- [ ] OpenCV Android SDK loads on a real arm64 device and coexists with Chaquopy
+      cv2; APK size delta recorded.
+- [ ] On the rig: a real pair produces a residual + front/back arrow; tuning the
+      slide toward NPP drives the metric into 🟢.
+- [ ] Δ heuristic keeps both targets framed and warns on a weak/over-tight setup.
+- [ ] `flutter analyze` clean; `flutter build apk` green.
+
+### Phase 9 — deferred / future (not in the first sweep)
+
+- **Single-class YOLO auto-box (figure only).** Replace the manual background ROI
+  with a custom-trained detector (TFLite, ~5–10 MB) — trained on the **figure
+  only**; the chessboard always uses `findChessboardCornersSB`. v1 hook: the ROI
+  is already an isolated input, so a detected box swaps in with nothing downstream
+  changing.
+- **Persist measured mm + a label for a 3D-printed rail stop.** Record the winning
+  slide-mm and a label naming a 3D-printed clip that snaps onto the nodal rod at
+  that position, so on location the user slides to a *physical* stop instead of
+  re-reading the scale. v1 hook: the result object already carries `slideMm` /
+  `partLabel`. **Requires adding the app's first persistent storage**
+  (`shared_preferences`), which is why it is out of the first sweep.
+- **Per-pair logging table & metric-vs-mm curve** to read the minimum directly
+  (also needs persistence).
+
+### Phase 9 — Definition of Done
+
+PR 9.1 (explainer animation) — **done, 2026-06-13:**
+
+- [x] Third sub-tab **Control | Parallax | Logs** (`gimbal_tab.dart` length 3);
+      "How it works" opens the explainer modal sheet.
+- [x] Two animated panels, each split 60% animation / 40% loupe; pure Flutter
+      (`CustomPainter` + `AnimationController`), no camera/gimbal/OpenCV.
+- [x] Plays by default (pan sweep + ΔY auto-cycle back→exact→forward); three ΔY
+      presets + ▶/⏸ auto-cycle↔manual; both panels always animate.
+- [x] Nodal-point loupe shows live ΔY + the pupil's fore/aft slide; viewfinder
+      loupe shows the board's drift against the figure axis.
+- [x] Traffic light + px readout + slide-direction text track ΔY in both views.
+- [x] `flutter analyze` clean; `flutter build apk --debug` green; verified on a
+      real device.
+
+PR 9.2–9.7 — **not started** (see the PR table). Phase 9 is *not* complete until
+the real capture + OpenCV metric + auto-pan path (9.2–9.7) lands and the on-rig
+checkpoints above pass.
 
 ## Out of scope (entire project)
 
