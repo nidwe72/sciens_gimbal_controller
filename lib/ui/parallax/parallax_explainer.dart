@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import 'parallax_glyphs.dart';
+
 /// PR 9.1 — the parallax-calibration explainer.
 ///
 /// A self-contained, CV-free teaching animation that shows *why* the
@@ -500,8 +502,8 @@ class _BirdsEyePainter extends CustomPainter {
     final boardApp = scene.apparentPx(scene.boardWidthM, scene.nearM);
     const figIcon = 38.0;
     final boardIcon = (figIcon * boardApp / figApp).clamp(14.0, figIcon);
-    _paintPerson(canvas, figurePt, figIcon, cs.tertiary);
-    _paintChessboard(canvas, boardPt, boardIcon, scene.lightColor(), n: 5);
+    paintPerson(canvas, figurePt, figIcon, cs.tertiary);
+    paintChessboard(canvas, boardPt, boardIcon, scene.lightColor(), n: 5);
 
     canvas.drawCircle(pupil, 5, Paint()..color = cs.primary);
     canvas.drawCircle(
@@ -513,19 +515,19 @@ class _BirdsEyePainter extends CustomPainter {
           ..color = cs.surface);
 
     // Distance annotations (this is the depth diagram → label distances here).
-    _paintLabel(canvas, size, 'figure — ${scene.farM.toStringAsFixed(0)} m',
+    paintLabel(canvas, size, 'figure — ${scene.farM.toStringAsFixed(0)} m',
         figurePt + Offset(figIcon * 0.6, -4), cs,
         bold: true);
-    _paintLabel(
+    paintLabel(
         canvas,
         size,
         'chessboard — ${scene.nearM.toStringAsFixed(0)} m',
         boardPt + Offset(boardIcon * 0.6 + 4, -4),
         cs,
         bold: true);
-    _paintLabel(canvas, size, 'camera', pivot + const Offset(10, -2), cs,
+    paintLabel(canvas, size, 'camera', pivot + const Offset(10, -2), cs,
         bold: true, alpha: 0.65);
-    _paintCaption(canvas, size, 'schematic — lateral offset exaggerated', cs);
+    paintCaption(canvas, size, 'schematic — lateral offset exaggerated', cs);
   }
 
   @override
@@ -592,10 +594,10 @@ class _NodalLoupePainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.6
           ..color = cs.outline);
-    _paintLabel(canvas, size, 'ΔY = ${scene.eMm.toStringAsFixed(0)} mm',
+    paintLabel(canvas, size, 'ΔY = ${scene.eMm.toStringAsFixed(0)} mm',
         Offset(0, size.height - 24), cs,
         center: true, fontSize: 11, bold: true);
-    _paintLabel(canvas, size, 'nodal point · rail offset',
+    paintLabel(canvas, size, 'nodal point · rail offset',
         Offset(0, size.height - 12), cs,
         center: true, fontSize: 9, alpha: 0.6);
   }
@@ -649,7 +651,7 @@ class _ViewfinderPainter extends CustomPainter {
           ..color = cs.onSurface
           ..strokeWidth = 3
           ..strokeCap = StrokeCap.round);
-    _paintLabel(canvas, size, 'figure axis', Offset(figX + 5, 4), cs,
+    paintLabel(canvas, size, 'figure axis', Offset(figX + 5, 4), cs,
         fontSize: 9);
 
     // Residual arrow figure-axis → drifted chessboard.
@@ -665,18 +667,18 @@ class _ViewfinderPainter extends CustomPainter {
           Offset(boardX - dir * 5, yBoard + 3), arrow);
     }
 
-    _paintPerson(canvas, Offset(figX, yFig), figH, cs.tertiary);
-    _paintChessboard(canvas, Offset(boardX, yBoard), boardW, light, n: 5);
+    paintPerson(canvas, Offset(figX, yFig), figH, cs.tertiary);
+    paintChessboard(canvas, Offset(boardX, yBoard), boardW, light, n: 5);
 
     // Dimension annotations (apparent-size view → label sizes, not distances).
-    _paintLabel(
+    paintLabel(
         canvas,
         size,
         '${scene.figureHeightM.toStringAsFixed(0)} m tall',
         Offset(figX - figH * 0.5 - 2, yFig - figH * 0.5),
         cs,
         fontSize: 9);
-    _paintLabel(
+    paintLabel(
         canvas,
         size,
         '${(scene.boardWidthM * 100).toStringAsFixed(0)} cm wide',
@@ -684,7 +686,7 @@ class _ViewfinderPainter extends CustomPainter {
         cs,
         fontSize: 9);
 
-    _paintCaption(
+    paintCaption(
         canvas,
         size,
         scene.residualPx < scene.greenPx
@@ -731,7 +733,7 @@ class _BoardLoupePainter extends CustomPainter {
         scene.sensorX(scene.phi, scene.farM);
     final board = r * 0.7;
     final shift = (rel * _boardLoupeMag).clamp(-r + board / 2, r - board / 2);
-    _paintChessboard(canvas, Offset(c.dx + shift, c.dy), board, light, n: 5);
+    paintChessboard(canvas, Offset(c.dx + shift, c.dy), board, light, n: 5);
     canvas.restore();
 
     canvas.drawCircle(
@@ -741,96 +743,11 @@ class _BoardLoupePainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.6
           ..color = cs.outline);
-    _paintLabel(canvas, size, 'chessboard vs figure axis',
+    paintLabel(canvas, size, 'chessboard vs figure axis',
         Offset(0, size.height - 12), cs,
         center: true, fontSize: 9);
   }
 
   @override
   bool shouldRepaint(covariant _BoardLoupePainter old) => true;
-}
-
-// ── Shared painters ──────────────────────────────────────────────────────────
-
-/// A simple, recognizable standing person (head, torso, arms, legs), [h] tall,
-/// centred on [center].
-void _paintPerson(Canvas canvas, Offset center, double h, Color color) {
-  final cx = center.dx;
-  final top = center.dy - h / 2;
-  final bottom = center.dy + h / 2;
-  final headR = h * 0.11;
-  final stroke = Paint()
-    ..color = color
-    ..strokeWidth = math.max(2, h * 0.06)
-    ..strokeCap = StrokeCap.round
-    ..style = PaintingStyle.stroke;
-
-  canvas.drawCircle(Offset(cx, top + headR), headR, Paint()..color = color);
-  final neckY = top + 2 * headR;
-  final hipY = top + h * 0.60;
-  canvas.drawLine(Offset(cx, neckY), Offset(cx, hipY), stroke); // torso
-  final shoulderY = neckY + h * 0.05;
-  canvas.drawLine(Offset(cx, shoulderY),
-      Offset(cx - h * 0.20, hipY - h * 0.05), stroke); // arms
-  canvas.drawLine(
-      Offset(cx, shoulderY), Offset(cx + h * 0.20, hipY - h * 0.05), stroke);
-  canvas.drawLine(
-      Offset(cx, hipY), Offset(cx - h * 0.14, bottom), stroke); // legs
-  canvas.drawLine(Offset(cx, hipY), Offset(cx + h * 0.14, bottom), stroke);
-}
-
-/// An [n]×[n] checker square of side [size], centred on [center].
-void _paintChessboard(Canvas canvas, Offset center, double size, Color color,
-    {int n = 6}) {
-  final left = center.dx - size / 2;
-  final top = center.dy - size / 2;
-  final cell = size / n;
-  final fill = Paint()..color = color;
-  for (var r = 0; r < n; r++) {
-    for (var c = 0; c < n; c++) {
-      if ((r + c).isEven) {
-        canvas.drawRect(
-            Rect.fromLTWH(left + c * cell, top + r * cell, cell, cell), fill);
-      }
-    }
-  }
-  canvas.drawRect(
-      Rect.fromLTWH(left, top, size, size),
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.2
-        ..color = color);
-}
-
-void _paintLabel(Canvas canvas, Size size, String text, Offset at, ColorScheme cs,
-    {double fontSize = 10,
-    bool center = false,
-    bool bold = false,
-    double alpha = 0.72}) {
-  final tp = TextPainter(
-    text: TextSpan(
-        text: text,
-        style: TextStyle(
-            fontSize: fontSize,
-            fontWeight: bold ? FontWeight.bold : FontWeight.normal,
-            color: cs.onSurface.withValues(alpha: alpha))),
-    textDirection: TextDirection.ltr,
-  )..layout(maxWidth: size.width);
-  var dx = center ? (size.width - tp.width) / 2 : at.dx;
-  if (dx + tp.width > size.width) dx = size.width - tp.width - 2;
-  if (dx < 2) dx = 2;
-  tp.paint(canvas, Offset(dx, at.dy));
-}
-
-void _paintCaption(Canvas canvas, Size size, String text, ColorScheme cs) {
-  final tp = TextPainter(
-    text: TextSpan(
-        text: text,
-        style: TextStyle(
-            fontSize: 9,
-            fontStyle: FontStyle.italic,
-            color: cs.onSurface.withValues(alpha: 0.45))),
-    textDirection: TextDirection.ltr,
-  )..layout(maxWidth: size.width);
-  tp.paint(canvas, Offset(8, size.height - tp.height - 4));
 }

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import '../parallax/parallax_explainer.dart';
+import '../parallax/parallax_info_sheet.dart';
 
 /// Third sub-tab under the Gimbal tab — **Control | Parallax | Logs**.
 ///
@@ -8,9 +8,9 @@ import '../parallax/parallax_explainer.dart';
 /// by sliding the camera fore/aft on the nodal rail until panning introduces no
 /// parallax between a near and a far target.
 ///
-/// PR 9.1 ships only the CV-free explainer animation (reached from the info
-/// icon / "How it works" button). The capture + measurement controls (focal
-/// input, auto-pan, the live metric) arrive in PRs 9.2–9.7.
+/// PR 9.1 / 9.1b ship the CV-free explainers (reached from the "More infos" link
+/// → a two-tab Problem | Solution panel). The capture + measurement controls
+/// (focal input, auto-pan, the live metric) arrive in PRs 9.2–9.7.
 class ParallaxCalibrationTab extends StatelessWidget {
   const ParallaxCalibrationTab({super.key});
 
@@ -40,10 +40,10 @@ class ParallaxCalibrationTab extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 20),
-            FilledButton.tonalIcon(
-              onPressed: () => showParallaxExplainer(context),
+            TextButton.icon(
+              onPressed: () => showParallaxInfo(context),
               icon: const Icon(Icons.info_outline),
-              label: const Text('How it works'),
+              label: const Text('More infos'),
             ),
           ],
         ),

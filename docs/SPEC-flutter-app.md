@@ -5269,6 +5269,82 @@ the drawn figure/chessboard, and `e` is now surfaced as **ΔY**):
 - **Illustrative metric gain (×8)** so the green→red bands span the preset range —
   the px number is teaching-only (the real metric is PR 9.4).
 
+### Metric-pipeline explainer + two-tab info panel (PR 9.1b)
+
+A second pure-Flutter, CV-free animation — the companion to PR 9.1. Where 9.1
+explains *why* parallax happens (the physics), 9.1b explains *how* the CV
+pipeline turns the two photos into the px metric. Same drawn figure + chessboard
+(shared glyph painters extracted to `lib/ui/parallax/parallax_glyphs.dart`).
+
+**Entry restructure.** The sub-tab's "How it works" button becomes a single
+**"More infos"** link opening a slide-in panel (modal bottom sheet) hosting a
+`DefaultTabController` with two tabs:
+
+- **Problem** — the NPP physics animation (PR 9.1, embedded unchanged).
+- **Solution** — this metric-pipeline animation.
+
+The host sheet is height-bounded (~85% of screen) so the `TabBarView` has bounded
+height and each tab's content scrolls internally.
+
+**The pipeline it shows (truthful asymmetry — the asymmetry *is* the metric):**
+
+- **Figure (background):** YOLO box → GrabCut mask → SIFT keypoints → matched
+  A↔B → fit the homography **H**.
+- **Chessboard (foreground):** `findChessboardCornersSB` → ordered corners
+  directly — *no* YOLO / GrabCut / SIFT.
+- **Metric:** apply H (fit to the figure) to the board corners → the leftover gap
+  is the residual px — handing straight back to the Problem tab.
+
+YOLO is depicted as the intended auto-detect even though v1 wires a *manual* box
+(YOLO itself is deferred — see Deferred). The Solution tab shows the YOLO stage
+regardless, since it teaches the intended pipeline.
+
+**Staged timeline** (auto-advancing loop + a 1…5 stage indicator + replay; tap to
+step). Stages 2–4 are per-image, so one representative frame is shown; the A/B
+pair appears at stage 5 (matching needs both):
+
+```
+ [1 Capture]   A and B (two slightly-panned frames) appear
+ [2 Detect]    YOLO box snaps around the figure
+ [3 Mask]      GrabCut dims the background; the figure mask lifts out
+ [4 Points]    SIFT keypoints on the figure · ordered corners on the board
+ [5 Match+H]   figure keypoints matched A↔B → fit H → figure locks (green);
+               same H on the board corners → they DON'T align → residual px
+```
+
+Pure Flutter — `CustomPainter` + `AnimationController`, reusing the 9.1 glyphs;
+no camera/gimbal/OpenCV.
+
+**Implementation steps**
+
+| Step | What | Verification |
+|------|------|--------------|
+| 1 | Extract shared glyphs → `parallax_glyphs.dart` (public `paintPerson`/`paintChessboard`/`paintLabel`/`paintCaption`); NPP explainer imports them | `flutter analyze` clean; NPP animation visually unchanged |
+| 2 | `ParallaxInfoSheet` — height-bounded bottom sheet, `DefaultTabController` [Problem \| Solution]; sub-tab link → **"More infos"**; Problem tab embeds the existing NPP animation | sheet opens; tab switch works; Problem = current animation |
+| 3 | `parallax_pipeline_explainer.dart` — staged timeline, figure-path vs board-path, stage indicator | on-device: stages advance; figure locks under H; board residual shown |
+| 4 | Spec/DoD + build | `flutter build apk --debug` green; device check |
+
+#### As built (PR 9.1b, 2026-06-13)
+
+`lib/ui/parallax/parallax_glyphs.dart` (shared painters), `parallax_pipeline_
+explainer.dart` (Solution tab), `parallax_info_sheet.dart` (two-tab host);
+`parallax_calibration_tab.dart` link is now a **"More infos"** `TextButton`.
+Deviations from the single-timeline sketch, settled in review:
+
+- **Two-level stepping.** The three rail cases are the **main steps**
+  (`Too far back · Correct (NPP) · Too far forward`, shown as chips); the five CV
+  stages (Capture → YOLO → GrabCut → SIFT/corners → Match + homography) are the
+  **sub-steps** under each. The final stage's residual reflects the case:
+  **Correct → board locks** (green, "residual 0 px"); **back/forward → amber
+  residual** with opposite drift + "slide forward" / "slide back".
+- **Controls:** a single **Play/Pause** (auto-loops, so no Replay); **prev/next**
+  walk sub-steps (clamped within the case); **fast-back/forward** jump *cases* and
+  **keep the current sub-step**, so parking on *Match + homography* and
+  fast-forwarding walks the residual green↔amber across the three cases. Tap-to-
+  step dropped.
+- **Glyph cleanup:** rendered Unicode `→ ↔ ✓ ≈` were swapped for plain text — on
+  Android they render via the colour-emoji font (blue tint). Comments keep them.
+
 ### UI
 
 Third sub-tab in `gimbal_tab.dart` (today `DefaultTabController(length: 2)` at
@@ -5297,6 +5373,7 @@ first** (pure Flutter, no deps, crystallises the concept).
 | PR | Title | Scope | Deps / risk | Verification |
 |----|-------|-------|-------------|--------------|
 | **9.1 ✓** | **Explainer animation** *(built 2026-06-13)* | CV-free `CustomPainter` + `AnimationController` teacher; each row split 60% animation / 40% loupe (nodal-point loupe shows live ΔY; chessboard-vs-figure-axis loupe); ΔY via three presets (no slider), ▶/⏸ auto-cycle↔manual, both panels always animate; person + 5×5 chessboard sized to real dims; "How it works" modal sheet | none — pure Flutter | ✓ `flutter analyze` clean, debug APK builds; on-device: auto-loop walks back→exact→forward, presets drive light 🟢→🔴, loupes show ΔY + board drift |
+| **9.1b ✓** | **Metric-pipeline explainer** *(built 2026-06-13)* | Pure-Flutter staged animation of the CV pipeline with truthful figure-vs-board asymmetry; **two-level stepping** (3 rail cases as main steps × 5 CV stages as sub-steps); Play/Pause + prev/next step + fast-back/forward case; "How it works" → **"More infos"** two-tab (Problem \| Solution) panel; shared glyphs in `parallax_glyphs.dart` | none — pure Flutter | ✓ `flutter analyze` clean, APK builds; on-device: cases × stages advance, Correct locks green, back/forward show amber residual + slide direction |
 | 9.2 | Sub-tab shell + focal input | Third tab Control \| Parallax \| Logs; reuse `_FocalSlider`; result widgets (number + 🔴🟡🟢 + arrow) wired to a stub metric | none | tab appears only when gimbal connected; stub metric renders |
 | 9.3 | OpenCV SDK + channel skeleton | Add `org.opencv`; `ParallaxChannel`; prove `OpenCVLoader.initLocal()` + a trivial round-trip | **OpenCV/Chaquopy coexistence; APK +size; ABI filters** | app builds + loads OpenCV on arm64 device; APK size logged; round-trip returns |
 | 9.4 | CV analysis engine | Java: downscale → board corners → ROI/GrabCut → features/match → bg homography → fg residual → normalize → metric JSON (+ direction sign) | depends 9.3 | unit-tested on a bundled fixture pair; residual + sign correct |
@@ -5344,6 +5421,20 @@ PR 9.1 (explainer animation) — **done, 2026-06-13:**
 - [x] Nodal-point loupe shows live ΔY + the pupil's fore/aft slide; viewfinder
       loupe shows the board's drift against the figure axis.
 - [x] Traffic light + px readout + slide-direction text track ΔY in both views.
+- [x] `flutter analyze` clean; `flutter build apk --debug` green; verified on a
+      real device.
+
+PR 9.1b (metric-pipeline explainer + two-tab "More infos" panel) — **done,
+2026-06-13:**
+
+- [x] "More infos" → height-bounded two-tab panel (**Problem** = NPP physics,
+      **Solution** = metric pipeline); shared glyphs extracted to `parallax_glyphs.dart`.
+- [x] Solution animation: two-level stepping (3 rail cases × 5 CV stages),
+      truthful figure (YOLO/GrabCut/SIFT) vs board (corner-finder) asymmetry.
+- [x] Play/Pause (auto-loop), prev/next sub-step, fast-back/forward case
+      (keeps sub-step); Correct locks green, back/forward show amber residual +
+      slide direction.
+- [x] Rendered Unicode arrow/check glyphs replaced with plain text.
 - [x] `flutter analyze` clean; `flutter build apk --debug` green; verified on a
       real device.
 
